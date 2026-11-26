@@ -13,10 +13,12 @@ preços_alimentos_ipca/
 ├── src/
 │   └── soja_alimentos/
 │       ├── __init__.py
+│       ├── ingestao.py          (pandas: conferência da Bronze e novas tentativas)
 │       ├── transforms.py        (PySpark: Silver e Gold)
 │       └── analise.py           (pandas/statsmodels: repasse HAC, Granger e Bonferroni)
 ├── tests/
 │   ├── conftest.py              (SparkSession local + correção de caminho no Windows)
+│   ├── test_ingestao.py
 │   ├── test_soja_pipeline.py
 │   └── test_analise.py
 ├── pyproject.toml               (pytest: pythonpath = src)
@@ -53,7 +55,7 @@ pytest>=8.0.0
 
 ```text
 APIs (yfinance: ZS=F, USDBRL=X | IBGE SIDRA 7060)
-                     │
+                     │  até 3 tentativas; confere início, fim e meses antes do overwrite
                      ▼
    workspace.agro.bronze_soja_dolar_diario   (cotações diárias brutas + timestamp)
    workspace.agro.bronze_ipca_subitens       (variações mensais brutas do SIDRA)
@@ -74,6 +76,7 @@ APIs (yfinance: ZS=F, USDBRL=X | IBGE SIDRA 7060)
 * **Separação de `lag_0m`:** A tabela Gold mantém `soja_brl_log_ret` (para estudo descritivo de repasse contemporâneo, relevante para *Óleo de soja*) e gera `soja_log_ret_lag_1m` até `6m` para modelagem preditiva sem *data leakage*.
 * **Proteção contra buracos na série:** O log-retorno só é calculado quando `months_between(mes, mes_prev) == 1`. O teste de Granger segue a mesma regra: a série é colocada no calendário mensal completo antes de defasar, então um mês ausente nunca é tratado como vizinho do seguinte.
 * **NaN de feriados:** CBOT e câmbio têm calendários diferentes, e num feriado de um só mercado a cotação vem `NaN`. No Spark, `NaN` não é nulo e `NaN > 0` é verdadeiro, então um único dia assim tornaria `NaN` a média do mês inteiro. Esses dias são removidos na Bronze (`dropna`) e de novo na Silver (`isnan`).
+* **Conferência antes do overwrite:** o Yahoo Finance às vezes responde sem erro, mas com uma tabela vazia ou com só parte do histórico. Como a Bronze é gravada com overwrite, gravar essa resposta encolheria Bronze, Silver e Gold sem nenhum aviso. Por isso o notebook 01 baixa as duas fontes, confere as respostas e só então grava. Se uma delas continuar incompleta depois de 3 tentativas, o notebook falha e as tabelas ficam como estavam.
 * **Múltiplas defasagens no Granger:** o p-valor de cada defasagem (1 a 4) é registrado separadamente, e o menor deles é corrigido por Bonferroni, porque escolher o menor p sem correção infla a chance de falso positivo.
 
 ---
@@ -82,22 +85,38 @@ APIs (yfinance: ZS=F, USDBRL=X | IBGE SIDRA 7060)
 
 Ingere as séries diárias de **Soja CBOT (`ZS=F`)** e **Dólar (`USDBRL=X`)** via `yfinance` e consulta dinamicamente os metadados da **Tabela 7060 (IBGE/SIDRA)** para coletar **Óleo de soja**, **Carnes**, **Frango inteiro**, **Frango em pedaços** e **Ovo de galinha**.
 
+Antes de gravar, o notebook confere as duas respostas com as funções de `src/soja_alimentos/ingestao.py` (descritas na seção 2) e tenta cada fonte até 3 vezes, esperando 60 e depois 120 segundos. Só grava quando as duas passam na conferência.
+
 ```python
 # Databricks notebook source
 # MAGIC %pip install -q -r ../requirements.txt
 
 # COMMAND ----------
 
+import os
+import sys
 import unicodedata
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-import pandas as pd
-import requests
-import yfinance as yf
+# Num Git folder do Databricks, a raiz do repositório entra no sys.path, mas `src/` não.
+# Desde o DBR 14, o diretório de trabalho do notebook é a pasta dele (notebooks/).
+SRC_DIR = os.path.abspath(os.path.join(os.getcwd(), "..", "src"))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+import pandas as pd  # noqa: E402
+import requests  # noqa: E402
+import yfinance as yf  # noqa: E402
+
+from soja_alimentos.ingestao import (  # noqa: E402
+    com_retentativas,
+    validar_ipca,
+    validar_mercado,
+)
 
 CATALOG = "workspace"
 SCHEMA = "agro"
-START_DATE = "2020-01-01"
+START_DATE = "2020-01-01"  # também o início da tabela 7060 do SIDRA
 
 ALVOS_IPCA = {
     "oleo_soja": "oleo de soja",
@@ -140,52 +159,81 @@ def descobrir_codigos_c315(alvos: dict[str, str]) -> dict[str, int]:
     return encontrados
 
 
-# 1. Ingestão Bronze: Soja CBOT + Dólar
-raw_yf = yf.download(["ZS=F", "USDBRL=X"], start=START_DATE, progress=False)["Close"]
-# Os dois mercados têm calendários diferentes: em feriado de um só deles a cotação vem NaN.
-# No Spark, NaN não é nulo, passa nos filtros e contamina a média do mês, então sai aqui.
-raw_yf = raw_yf.dropna(subset=["ZS=F", "USDBRL=X"])
-raw_yf.index = pd.to_datetime(raw_yf.index).tz_localize(None)
-pdf_mercado = (
-    raw_yf.rename(columns={"ZS=F": "soja_cbot", "USDBRL=X": "dolar"})
-    .reset_index()
-    .rename(columns={"Date": "data"})
-)
-pdf_mercado["data"] = pdf_mercado["data"].dt.strftime("%Y-%m-%d")
-pdf_mercado["ingested_at_utc"] = datetime.now(timezone.utc).isoformat()
+def baixar_mercado() -> pd.DataFrame:
+    """Cotações diárias de Soja CBOT e Dólar, conferidas antes de seguir."""
+    raw_yf = yf.download(["ZS=F", "USDBRL=X"], start=START_DATE, progress=False)["Close"]
+    # Os dois mercados têm calendários diferentes: em feriado de um só deles a cotação vem NaN.
+    # No Spark, NaN não é nulo, passa nos filtros e contamina a média do mês, então sai aqui.
+    raw_yf = raw_yf.dropna(subset=["ZS=F", "USDBRL=X"])
+    raw_yf.index = pd.to_datetime(raw_yf.index).tz_localize(None)
+    pdf = (
+        raw_yf.rename(columns={"ZS=F": "soja_cbot", "USDBRL=X": "dolar"})
+        .reset_index()
+        .rename(columns={"Date": "data"})
+    )
+    pdf["data"] = pdf["data"].dt.strftime("%Y-%m-%d")
+    pdf["ingested_at_utc"] = datetime.now(timezone.utc).isoformat()
+    validar_mercado(
+        pdf, inicio=date.fromisoformat(START_DATE), hoje=datetime.now(timezone.utc).date()
+    )
+    return pdf
 
+
+def baixar_ipca() -> pd.DataFrame:
+    """Variações mensais dos subitens do IPCA (SIDRA 7060), conferidas antes de seguir."""
+    codigos = descobrir_codigos_c315(ALVOS_IPCA)
+    ids_str = ",".join(str(v) for v in codigos.values())
+    url_sidra = (
+        f"https://apisidra.ibge.gov.br/values/t/7060/n1/all/v/63/p/all/c315/{ids_str}?formato=json"
+    )
+
+    resp = requests.get(url_sidra, timeout=60)
+    resp.raise_for_status()
+    rows = resp.json()[1:]  # pula cabeçalho descritivo (D3 = Mês, D4 = subitem)
+
+    id_to_alias = {str(v): k for k, v in codigos.items()}
+    pdf = pd.DataFrame(
+        [
+            {
+                "periodo_yyyymm": str(r["D3C"]),
+                "subitem_id": str(r["D4C"]),
+                "subitem": id_to_alias.get(str(r["D4C"]), str(r["D4N"])),
+                "valor_raw": str(r["V"]),
+                "ingested_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            for r in rows
+        ],
+        columns=["periodo_yyyymm", "subitem_id", "subitem", "valor_raw", "ingested_at_utc"],
+    )
+    validar_ipca(
+        pdf,
+        subitens=ALVOS_IPCA,
+        inicio=date.fromisoformat(START_DATE),
+        hoje=datetime.now(timezone.utc).date(),
+    )
+    return pdf
+
+
+# 1. Baixa e confere as duas fontes antes de gravar qualquer coisa. Se uma delas vier vazia,
+#    parcial ou desatualizada nas 3 tentativas, o notebook falha e as tabelas ficam como estavam.
+pdf_mercado = com_retentativas(baixar_mercado, "Yahoo Finance (ZS=F, USDBRL=X)")
+pdf_ipca = com_retentativas(baixar_ipca, "IBGE SIDRA 7060")
+
+# 2. Ingestão Bronze: Soja CBOT + Dólar
 spark.createDataFrame(pdf_mercado).write.format("delta").mode("overwrite").saveAsTable(
     f"{CATALOG}.{SCHEMA}.bronze_soja_dolar_diario"
 )
 
-# 2. Ingestão Bronze: IPCA Subitens (SIDRA 7060)
-codigos = descobrir_codigos_c315(ALVOS_IPCA)
-ids_str = ",".join(str(v) for v in codigos.values())
-url_sidra = f"https://apisidra.ibge.gov.br/values/t/7060/n1/all/v/63/p/all/c315/{ids_str}?formato=json"
-
-resp = requests.get(url_sidra, timeout=60)
-resp.raise_for_status()
-rows = resp.json()[1:]  # pula cabeçalho descritivo (D3 = Mês, D4 = subitem)
-
-id_to_alias = {str(v): k for k, v in codigos.items()}
-pdf_ipca = pd.DataFrame(
-    [
-        {
-            "periodo_yyyymm": str(r["D3C"]),
-            "subitem_id": str(r["D4C"]),
-            "subitem": id_to_alias.get(str(r["D4C"]), str(r["D4N"])),
-            "valor_raw": str(r["V"]),
-            "ingested_at_utc": datetime.now(timezone.utc).isoformat(),
-        }
-        for r in rows
-    ]
-)
-
+# 3. Ingestão Bronze: IPCA Subitens (SIDRA 7060)
 spark.createDataFrame(pdf_ipca).write.format("delta").mode("overwrite").saveAsTable(
     f"{CATALOG}.{SCHEMA}.bronze_ipca_subitens"
 )
 
-print("Ingestão Bronze concluída com sucesso.")
+print(
+    f"Ingestão Bronze concluída: {len(pdf_mercado)} dias de cotação "
+    f"({pdf_mercado['data'].min()} a {pdf_mercado['data'].max()}) e {len(pdf_ipca)} variações "
+    f"do IPCA ({pdf_ipca['periodo_yyyymm'].min()} a {pdf_ipca['periodo_yyyymm'].max()})."
+)
 ```
 
 ---
@@ -416,11 +464,179 @@ def p_valor_bonferroni(p_valores: Iterable[float]) -> float:
     return float(min(1.0, p.min() * p.size))
 ```
 
+### Conferência da ingestão (`src/soja_alimentos/ingestao.py`)
+
+Funções em pandas, sem Spark, que o notebook 01 chama antes de sobrescrever a Bronze. Todas levantam `DadosIncompletos` com uma mensagem que diz o que faltou.
+
+* **`validar_mercado`:** as cotações precisam começar até 10 dias depois de `START_DATE`, ter a última data a no máximo 7 dias da execução e trazer ao menos 15 dias com os dois mercados abertos em cada mês completo (o histórico real tem no mínimo 19). Datas repetidas e preços nulos, `NaN` ou menores ou iguais a zero também recusam a resposta.
+* **`validar_ipca`:** a resposta precisa trazer os 5 subitens, e só eles, cada um com todos os meses desde janeiro de 2020 e com valor divulgado a no máximo 2 meses do mês da execução. A folga de 2 meses existe porque o IBGE divulga o IPCA do mês anterior por volta do dia 10.
+* **`com_retentativas`:** chama a função de download até 3 vezes, esperando 60 e depois 120 segundos entre as tentativas. Na última falha, repassa o erro original.
+
+```python
+"""Conferência dos dados baixados na ingestão Bronze, antes de sobrescrever as tabelas (sem Spark).
+
+O Yahoo Finance e o SIDRA às vezes respondem sem erro, mas com dados vazios, parciais ou
+desatualizados. Como a Bronze é gravada com overwrite, gravar uma resposta dessas encolheria
+Bronze, Silver e Gold em silêncio. Estas funções recusam a resposta antes da gravação.
+"""
+import time
+from collections.abc import Callable, Iterable
+from datetime import date
+from typing import TypeVar
+
+import numpy as np
+import pandas as pd
+
+T = TypeVar("T")
+
+
+class DadosIncompletos(ValueError):
+    """A fonte respondeu, mas com dados vazios, parciais ou desatualizados."""
+
+
+def _resumir(itens: list, limite: int = 5) -> str:
+    texto = ", ".join(str(i) for i in itens[:limite])
+    return texto + (f" e mais {len(itens) - limite}" if len(itens) > limite else "")
+
+
+def validar_mercado(
+    pdf: pd.DataFrame,
+    inicio: date,
+    hoje: date,
+    folga_inicio_dias: int = 10,
+    max_atraso_dias: int = 7,
+    min_dias_por_mes: int = 15,
+) -> None:
+    """Confere as cotações diárias (colunas `data`, `soja_cbot` e `dolar`).
+
+    Exige que o histórico comece até `folga_inicio_dias` depois de `inicio`, que a última
+    cotação tenha no máximo `max_atraso_dias` e que todo mês completo, ou seja, todos menos
+    o último, tenha ao menos `min_dias_por_mes` dias com os dois mercados abertos.
+    """
+    faltando = {"data", "soja_cbot", "dolar"} - set(pdf.columns)
+    if faltando:
+        raise DadosIncompletos(f"As cotações vieram sem as colunas {sorted(faltando)}.")
+    if pdf.empty:
+        raise DadosIncompletos("O Yahoo Finance não devolveu nenhuma cotação.")
+
+    datas = pd.to_datetime(pdf["data"])
+    if datas.duplicated().any():
+        raise DadosIncompletos("As cotações têm datas repetidas.")
+    precos = pdf[["soja_cbot", "dolar"]].to_numpy(dtype=float)
+    if not np.isfinite(precos).all() or (precos <= 0).any():
+        raise DadosIncompletos("Há cotações nulas, NaN ou menores ou iguais a zero.")
+
+    primeira, ultima = datas.min().date(), datas.max().date()
+    if (primeira - inicio).days > folga_inicio_dias:
+        raise DadosIncompletos(
+            f"O histórico de cotações começa em {primeira}, e não perto de {inicio}: veio parcial."
+        )
+    if (hoje - ultima).days > max_atraso_dias:
+        raise DadosIncompletos(
+            f"A última cotação é de {ultima}, mais de {max_atraso_dias} dias antes de {hoje}."
+        )
+
+    meses = datas.dt.to_period("M")
+    calendario = pd.period_range(meses.min(), meses.max(), freq="M")
+    dias_por_mes = meses.value_counts().reindex(calendario, fill_value=0)
+    ralos = dias_por_mes.iloc[:-1][dias_por_mes.iloc[:-1] < min_dias_por_mes]
+    if not ralos.empty:
+        raise DadosIncompletos(
+            f"Meses com menos de {min_dias_por_mes} dias de cotação: "
+            f"{_resumir([str(m) for m in ralos.index])}."
+        )
+
+
+def validar_ipca(
+    pdf: pd.DataFrame,
+    subitens: Iterable[str],
+    inicio: date,
+    hoje: date,
+    max_atraso_meses: int = 2,
+) -> None:
+    """Confere as variações mensais do SIDRA (colunas `periodo_yyyymm`, `subitem`, `valor_raw`).
+
+    Exige todos os `subitens`, e só eles, cada um com o calendário completo desde `inicio`
+    (ou antes) e com um valor numérico em algum mês a no máximo `max_atraso_meses` do mês de
+    `hoje`. Com o padrão de 2, uma execução em dezembro aceita outubro como último mês, porque
+    o IBGE divulga o IPCA de novembro por volta do dia 10 de dezembro.
+    """
+    faltando = {"periodo_yyyymm", "subitem", "valor_raw"} - set(pdf.columns)
+    if faltando:
+        raise DadosIncompletos(f"O IPCA veio sem as colunas {sorted(faltando)}.")
+    if pdf.empty:
+        raise DadosIncompletos("O SIDRA não devolveu nenhuma variação do IPCA.")
+
+    esperados = set(subitens)
+    recebidos = set(pdf["subitem"])
+    if esperados - recebidos:
+        raise DadosIncompletos(f"Faltam subitens do IPCA: {sorted(esperados - recebidos)}.")
+    if recebidos - esperados:
+        raise DadosIncompletos(f"Vieram subitens inesperados: {sorted(recebidos - esperados)}.")
+    if pdf.duplicated(["subitem", "periodo_yyyymm"]).any():
+        raise DadosIncompletos("O IPCA tem meses repetidos para um mesmo subitem.")
+
+    dados = pdf.assign(
+        periodo=pd.to_datetime(pdf["periodo_yyyymm"], format="%Y%m").dt.to_period("M"),
+        valor=pd.to_numeric(pdf["valor_raw"], errors="coerce"),
+    )
+    mes_inicio = pd.Period(inicio, freq="M")
+    ultimo_aceito = pd.Period(hoje, freq="M") - max_atraso_meses
+
+    for subitem, grp in dados.groupby("subitem"):
+        periodos = grp["periodo"].sort_values()
+        if periodos.iloc[0] > mes_inicio:
+            raise DadosIncompletos(
+                f"O IPCA de '{subitem}' começa em {periodos.iloc[0]}, depois de {mes_inicio}."
+            )
+        calendario = pd.period_range(periodos.iloc[0], periodos.iloc[-1], freq="M")
+        ausentes = sorted(set(calendario) - set(periodos))
+        if ausentes:
+            raise DadosIncompletos(
+                f"Faltam meses do IPCA de '{subitem}': {_resumir([str(m) for m in ausentes])}."
+            )
+        com_valor = grp.loc[grp["valor"].notna(), "periodo"]
+        if com_valor.empty or com_valor.max() < ultimo_aceito:
+            ultimo = com_valor.max() if not com_valor.empty else "nenhum"
+            raise DadosIncompletos(
+                f"O último mês com valor do IPCA de '{subitem}' é {ultimo}, "
+                f"mais de {max_atraso_meses} meses antes de {hoje:%Y-%m}."
+            )
+
+
+def com_retentativas(
+    funcao: Callable[[], T],
+    descricao: str,
+    tentativas: int = 3,
+    espera_s: float = 60,
+    dormir: Callable[[float], None] = time.sleep,
+) -> T:
+    """Chama `funcao` até ela dar certo, esperando `espera_s × n` segundos após a n-ésima falha.
+
+    Na última tentativa, a exceção original sobe sem alteração.
+    """
+    if tentativas < 1:
+        raise ValueError("`tentativas` deve ser pelo menos 1.")
+    for n in range(1, tentativas + 1):
+        try:
+            return funcao()
+        except Exception as erro:
+            if n == tentativas:
+                raise
+            espera = espera_s * n
+            print(
+                f"{descricao}: a tentativa {n} de {tentativas} falhou ({erro!r}). "
+                f"Nova tentativa em {espera:.0f} s."
+            )
+            dormir(espera)
+    raise AssertionError("inalcançável")
+```
+
 ---
 
 ## 3. Notebook `notebooks/02_silver_gold_transformacoes.py`
 
-Num Git folder do Databricks, a raiz do repositório entra no `sys.path`, mas `src/` não. Por isso os notebooks 02 e 03 acrescentam `../src` antes de importar o pacote (desde o DBR 14, o diretório de trabalho do notebook é a pasta dele).
+Num Git folder do Databricks, a raiz do repositório entra no `sys.path`, mas `src/` não. Por isso os três notebooks acrescentam `../src` antes de importar o pacote (desde o DBR 14, o diretório de trabalho do notebook é a pasta dele).
 
 ```python
 # Databricks notebook source
@@ -572,6 +788,17 @@ Os testes rodam localmente com `pytest`, sem Databricks. A `SparkSession` local 
 | `test_mes_faltante_nao_gera_retorno_ou_lag_invalido` | Com um mês faltando, nem o retorno nem os lags de 1 e 2 meses atravessam o buraco. |
 | `test_silver_soja_descarta_nan_nulos_e_lixo` | Dias com `NaN` (feriado de um só mercado), nulos, preço zero e data inválida ficam fora da média, e o mês abaixo do mínimo de dias úteis é descartado. |
 | `test_silver_ipca_tipa_valores_e_remove_duplicados` | Valores `...` e `-` do SIDRA, mês inexistente e linhas repetidas são removidos. |
+| `test_mercado_aceita_historico_completo_com_mes_corrente_parcial` | Um histórico completo passa, mesmo com só 2 dias no mês corrente. |
+| `test_mercado_recusa_resposta_vazia_ou_sem_coluna` | Resposta vazia do Yahoo Finance, como a que acontece de vez em quando, ou sem uma das colunas, é recusada. |
+| `test_mercado_recusa_historico_parcial` | Histórico que começa tarde, que termina há mais de 7 dias ou com um mês ausente ou ralo é recusado. |
+| `test_mercado_recusa_preco_invalido` | Preço `NaN`, zero, negativo ou infinito é recusado. |
+| `test_mercado_recusa_data_repetida` | Data repetida é recusada. |
+| `test_ipca_aceita_resposta_completa_e_valor_especial_no_meio` | Uma resposta completa passa, mesmo com um `-` do SIDRA no meio da série ou antes da divulgação do mês anterior. |
+| `test_ipca_recusa_resposta_vazia_ou_subitem_errado` | Resposta vazia, subitem faltando, subitem inesperado ou mês repetido são recusados. |
+| `test_ipca_recusa_historico_parcial` | Subitem que começa depois de janeiro de 2020 ou com um mês ausente é recusado. |
+| `test_ipca_recusa_resposta_desatualizada` | Último valor divulgado com mais de 2 meses de atraso é recusado, e meses listados sem valor (`...`) não contam. |
+| `test_com_retentativas_espera_cada_vez_mais_e_devolve_o_resultado` | Depois de duas falhas, a terceira tentativa devolve o resultado, com esperas de 60 e 120 segundos. |
+| `test_com_retentativas_repassa_o_ultimo_erro` | Quando todas as tentativas falham, o erro da última sobe sem alteração. |
 | `test_granger_sem_buracos_igual_statsmodels` | Sem buracos, a estatística F e o p-valor batem com o `grangercausalitytests` do statsmodels em todas as defasagens. |
 | `test_granger_descarta_observacoes_que_atravessam_buraco` | Com um mês ausente, esse mês e as `p` observações seguintes saem da amostra. |
 | `test_granger_amostra_insuficiente_falha_com_mensagem` | Amostra pequena demais gera um erro claro, e não um resultado sem sentido. |

@@ -19,7 +19,7 @@ A documentação completa, com todo o código e as decisões de metodologia, est
 
 ```text
 yfinance (ZS=F, USDBRL=X) + IBGE SIDRA 7060
-        │  01_bronze_ingestao
+        │  01_bronze_ingestao (confere as respostas antes de gravar)
         ▼
 Bronze   cotações diárias e variações mensais brutas
         │  02_silver_gold_transformacoes
@@ -32,13 +32,15 @@ Gold     log-retornos + defasagens de 1 a 6 meses
 MLflow   elasticidade, R² ajustado e p-valores de Granger por subitem
 ```
 
+O Yahoo Finance às vezes responde sem erro, mas com uma tabela vazia ou com só parte do histórico. Por isso o notebook 01 tenta cada fonte até 3 vezes e confere a resposta antes de sobrescrever a Bronze: as cotações precisam cobrir de jan/2020 até a última semana, sem meses ralos, e o IPCA precisa trazer os 5 subitens, sem meses faltando, até no máximo 2 meses atrás. Se uma fonte continuar incompleta, o notebook falha e as tabelas ficam como estavam.
+
 As tabelas ficam em `workspace.agro`, no Unity Catalog. Para usar outro catálogo ou schema, altere `CATALOG` e `SCHEMA` no início de cada notebook.
 
 ## Estrutura
 
 ```text
 notebooks/              notebooks do Databricks, executados em ordem (01 → 02 → 03)
-src/soja_alimentos/     transformações PySpark (transforms.py) e testes estatísticos (analise.py)
+src/soja_alimentos/     conferência da ingestão (ingestao.py), transformações PySpark (transforms.py) e testes estatísticos (analise.py)
 tests/                  testes com pytest, que rodam localmente sem Databricks
 requirements.txt        bibliotecas a instalar no cluster
 requirements-dev.txt    ambiente local de testes
@@ -65,7 +67,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -v
 ```
 
-São 11 testes. Eles cobrem o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, o erro-padrão da elasticidade acumulada e o teste de Granger, conferido contra o do statsmodels.
+O pytest roda 25 testes. Eles cobrem a conferência das respostas do Yahoo Finance e do SIDRA e as novas tentativas, o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, o erro-padrão da elasticidade acumulada e o teste de Granger, conferido contra o do statsmodels.
 
 ## Limitações
 
