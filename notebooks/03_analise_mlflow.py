@@ -4,7 +4,9 @@
 # COMMAND ----------
 
 import os
+import shutil
 import sys
+from pathlib import Path
 
 # Num Git folder do Databricks, a raiz do repositório entra no sys.path, mas `src/` não.
 # Desde o DBR 14, o diretório de trabalho do notebook é a pasta dele (notebooks/).
@@ -14,8 +16,12 @@ if SRC_DIR not in sys.path:
 
 import mlflow  # noqa: E402
 import pandas as pd  # noqa: E402
+from IPython.display import Image  # noqa: E402
+from IPython.display import display as mostrar  # noqa: E402
 
+from soja_alimentos import graficos  # noqa: E402
 from soja_alimentos.analise import (  # noqa: E402
+    curva_de_repasse,
     granger_por_lag,
     p_valor_bonferroni,
     repasse_acumulado,
@@ -36,7 +42,11 @@ pdf = (
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment("/Shared/soja_alimentos_analise")
 
+FIGURAS = Path("/tmp/soja_alimentos_figuras")
+shutil.rmtree(FIGURAS, ignore_errors=True)  # só as figuras desta execução vão para o MLflow
+
 resumos = []
+reps, curvas, granger = {}, {}, {}
 
 with mlflow.start_run(run_name="repasse_hac_e_granger"):
     for subitem, grp in pdf.groupby("subitem"):
@@ -47,6 +57,9 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         #    Os lags da Gold já vêm nulos quando cairiam num buraco do calendário.
         lag_cols = ["soja_brl_log_ret"] + [f"soja_log_ret_lag_{k}m" for k in range(1, 5)]
         rep = repasse_acumulado(grp, y="ipca_log_ret", cols=lag_cols, hac_maxlags=3)
+        # A mesma regressão, somando só até cada defasagem: em quantos meses o repasse acontece.
+        curvas[subitem] = curva_de_repasse(grp, y="ipca_log_ret", cols=lag_cols, hac_maxlags=3)
+        reps[subitem] = rep
 
         # 2. Granger (Soja -> Subitem IPCA) por defasagem, no calendário mensal completo:
         #    meses ausentes não são tratados como consecutivos.
@@ -55,6 +68,7 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         )
         # Escolher o menor p entre várias defasagens infla o falso positivo: corrige por Bonferroni.
         p_bonf = p_valor_bonferroni(gc["p_valor"])
+        granger[subitem] = gc["p_valor"]
 
         mlflow.log_metric(f"{subitem}_elasticidade_4m", rep["elasticidade"])
         mlflow.log_metric(f"{subitem}_elasticidade_4m_ep", rep["erro_padrao"])
@@ -83,3 +97,15 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
 
     df_resumo = pd.DataFrame(resumos).set_index("subitem")
     display(df_resumo)
+
+    # Gráficos: aparecem aqui e ficam no run do MLflow (Artifacts → figuras), com a tabela-resumo.
+    caminhos = [
+        graficos.soja_e_alimentos(pdf, FIGURAS),
+        graficos.elasticidade_por_subitem(reps, FIGURAS),
+        graficos.curvas_de_repasse(curvas, FIGURAS),
+        graficos.granger_p_valores(granger, FIGURAS),
+    ]
+    df_resumo.to_csv(FIGURAS / "resumo_por_subitem.csv")
+    mlflow.log_artifacts(str(FIGURAS), artifact_path="figuras")
+    for caminho in caminhos:
+        mostrar(Image(filename=str(caminho)))

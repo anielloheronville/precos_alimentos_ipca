@@ -68,6 +68,32 @@ def granger_por_lag(
     return pd.DataFrame(linhas).set_index("lag")
 
 
+def _ajustar_defasagens(df: pd.DataFrame, y: str, cols: list[str], hac_maxlags: int):
+    dados = df[[y] + cols].dropna()
+    n_parametros = len(cols) + 1
+    if len(dados) <= n_parametros:
+        raise ValueError(
+            f"Observações insuficientes ({len(dados)}) para estimar {n_parametros} parâmetros."
+        )
+    X = sm.add_constant(dados[cols], has_constant="add")
+    return sm.OLS(dados[y], X).fit(cov_type="HAC", cov_kwds={"maxlags": hac_maxlags})
+
+
+def _testar_soma(modelo, cols_somadas: list[str]) -> dict[str, float]:
+    """Soma dos coeficientes de `cols_somadas`, com erro-padrão sqrt(r' V r) da covariância HAC."""
+    contraste = np.array([1.0 if nome in cols_somadas else 0.0 for nome in modelo.params.index])
+    teste = modelo.t_test(contraste)
+    ic_inf, ic_sup = np.asarray(teste.conf_int(alpha=0.05)).ravel()
+    return {
+        "soma": float(np.asarray(teste.effect).item()),
+        "erro_padrao": float(np.asarray(teste.sd).item()),
+        "estatistica": float(np.asarray(teste.tvalue).item()),
+        "p_valor": float(np.asarray(teste.pvalue).item()),
+        "ic95_inf": float(ic_inf),
+        "ic95_sup": float(ic_sup),
+    }
+
+
 def repasse_acumulado(
     df: pd.DataFrame,
     y: str,
@@ -83,30 +109,48 @@ def repasse_acumulado(
 
     As linhas de `df` devem estar em ordem cronológica, porque o HAC usa a ordem das linhas.
     """
-    dados = df[[y] + cols].dropna()
-    n_parametros = len(cols) + 1
-    if len(dados) <= n_parametros:
-        raise ValueError(
-            f"Observações insuficientes ({len(dados)}) para estimar {n_parametros} parâmetros."
-        )
-
-    X = sm.add_constant(dados[cols], has_constant="add")
-    modelo = sm.OLS(dados[y], X).fit(cov_type="HAC", cov_kwds={"maxlags": hac_maxlags})
-
-    contraste = np.array([1.0 if nome in cols else 0.0 for nome in modelo.params.index])
-    teste = modelo.t_test(contraste)
-    ic_inf, ic_sup = np.asarray(teste.conf_int(alpha=0.05)).ravel()
-
+    modelo = _ajustar_defasagens(df, y, cols, hac_maxlags)
+    soma = _testar_soma(modelo, cols)
     return {
         "n_obs": int(modelo.nobs),
-        "elasticidade": float(np.asarray(teste.effect).item()),
-        "erro_padrao": float(np.asarray(teste.sd).item()),
-        "estatistica": float(np.asarray(teste.tvalue).item()),
-        "p_valor": float(np.asarray(teste.pvalue).item()),
-        "ic95_inf": float(ic_inf),
-        "ic95_sup": float(ic_sup),
+        "elasticidade": soma["soma"],
+        "erro_padrao": soma["erro_padrao"],
+        "estatistica": soma["estatistica"],
+        "p_valor": soma["p_valor"],
+        "ic95_inf": soma["ic95_inf"],
+        "ic95_sup": soma["ic95_sup"],
         "r2_ajustado": float(modelo.rsquared_adj),
     }
+
+
+def curva_de_repasse(
+    df: pd.DataFrame,
+    y: str,
+    cols: list[str],
+    hac_maxlags: int = 3,
+) -> pd.DataFrame:
+    """Elasticidade acumulada até cada defasagem, na mesma regressão de `repasse_acumulado`.
+
+    `cols` deve vir em ordem de defasagem (mesmo mês, 1 mês, 2 meses...). A linha `defasagem = h`
+    soma os coeficientes de `cols[0]` a `cols[h]`, com erro-padrão e IC de 95% da covariância
+    HAC completa. A última linha é a elasticidade de `repasse_acumulado`.
+    """
+    modelo = _ajustar_defasagens(df, y, cols, hac_maxlags)
+    linhas = []
+    for h, col in enumerate(cols):
+        soma = _testar_soma(modelo, cols[: h + 1])
+        linhas.append(
+            {
+                "defasagem": h,
+                "coeficiente": float(modelo.params[col]),
+                "acumulado": soma["soma"],
+                "erro_padrao": soma["erro_padrao"],
+                "p_valor": soma["p_valor"],
+                "ic95_inf": soma["ic95_inf"],
+                "ic95_sup": soma["ic95_sup"],
+            }
+        )
+    return pd.DataFrame(linhas).set_index("defasagem")
 
 
 def p_valor_bonferroni(p_valores: Iterable[float]) -> float:

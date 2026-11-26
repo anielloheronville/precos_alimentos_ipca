@@ -8,6 +8,7 @@ from scipy.stats import norm
 from statsmodels.tsa.stattools import grangercausalitytests
 
 from soja_alimentos.analise import (
+    curva_de_repasse,
     granger_por_lag,
     p_valor_bonferroni,
     reindexar_mensal,
@@ -110,6 +111,34 @@ def test_repasse_descarta_linhas_incompletas_e_amostra_insuficiente():
 
     with pytest.raises(ValueError, match="insuficientes"):
         repasse_acumulado(df.head(8), y="y", cols=["x_lag0", "x_lag1"])
+
+
+def test_curva_de_repasse_acumula_coeficientes_e_termina_na_elasticidade():
+    df = _serie_repasse()
+    cols = ["x_lag0", "x_lag1"]
+    curva = curva_de_repasse(df, y="y", cols=cols, hac_maxlags=3)
+    total = repasse_acumulado(df, y="y", cols=cols, hac_maxlags=3)
+
+    referencia = sm.OLS(df["y"], sm.add_constant(df[cols])).fit(
+        cov_type="HAC", cov_kwds={"maxlags": 3}
+    )
+    assert list(curva.index) == [0, 1]
+    assert np.allclose(curva["coeficiente"], referencia.params[cols], rtol=1e-12)
+    assert np.allclose(curva["acumulado"], np.cumsum(referencia.params[cols]), rtol=1e-12)
+    # Só o mesmo mês: o erro-padrão é o do próprio coeficiente.
+    assert math.isclose(curva.loc[0, "erro_padrao"], referencia.bse["x_lag0"], rel_tol=1e-12)
+    # A última linha é a elasticidade acumulada, com o mesmo erro-padrão e o mesmo IC.
+    for col_curva, chave in [
+        ("acumulado", "elasticidade"),
+        ("erro_padrao", "erro_padrao"),
+        ("p_valor", "p_valor"),
+        ("ic95_inf", "ic95_inf"),
+        ("ic95_sup", "ic95_sup"),
+    ]:
+        assert math.isclose(curva.loc[1, col_curva], total[chave], rel_tol=1e-12)
+    # Efeitos verdadeiros: 0,3 no mesmo mês e 0,5 acumulado em um mês.
+    assert curva.loc[0, "ic95_inf"] < 0.3 < curva.loc[0, "ic95_sup"]
+    assert curva.loc[1, "ic95_inf"] < 0.5 < curva.loc[1, "ic95_sup"]
 
 
 def test_p_valor_bonferroni():

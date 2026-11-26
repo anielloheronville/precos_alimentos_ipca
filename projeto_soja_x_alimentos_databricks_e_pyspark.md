@@ -15,12 +15,16 @@ preços_alimentos_ipca/
 │       ├── __init__.py
 │       ├── ingestao.py          (pandas: conferência da Bronze e novas tentativas)
 │       ├── transforms.py        (PySpark: Silver e Gold)
-│       └── analise.py           (pandas/statsmodels: repasse HAC, Granger e Bonferroni)
+│       ├── analise.py           (pandas/statsmodels: repasse HAC, curva de repasse, Granger e Bonferroni)
+│       └── graficos.py          (Matplotlib: gráficos dos resultados)
 ├── tests/
 │   ├── conftest.py              (SparkSession local + correção de caminho no Windows)
 │   ├── test_ingestao.py
 │   ├── test_soja_pipeline.py
-│   └── test_analise.py
+│   ├── test_analise.py
+│   └── test_graficos.py
+├── reports/
+│   └── figuras/                 (gráficos da última execução, os mesmos do MLflow)
 ├── pyproject.toml               (pytest: pythonpath = src)
 ├── requirements.txt             (cluster Databricks)
 ├── requirements-dev.txt         (testes locais)
@@ -37,6 +41,7 @@ O cluster e o ambiente local têm listas separadas. `pyspark`, `pandas`, `numpy`
 yfinance>=0.2.40
 requests>=2.31.0
 statsmodels>=0.14.0
+matplotlib>=3.7
 ```
 
 `requirements-dev.txt` (testes locais):
@@ -46,6 +51,7 @@ pyspark>=3.5.0
 pandas>=2.1.0,<3      # PySpark ainda não suporta pandas 3 por completo
 numpy>=1.26.0
 statsmodels>=0.14.0
+matplotlib>=3.7
 pytest>=8.0.0
 ```
 
@@ -68,7 +74,7 @@ APIs (yfinance: ZS=F, USDBRL=X | IBGE SIDRA 7060)
    workspace.agro.gold_soja_alimentos_features  (Liquid Clustering: subitem, mes)
                      │
                      ▼
-   statsmodels + MLflow                      (correlação por lag, OLS-HAC, Granger)
+   statsmodels + MLflow                      (OLS-HAC, curva de repasse, Granger, gráficos)
 ```
 
 ### Decisões Metodológicas
@@ -342,6 +348,7 @@ def build_gold_features(
 A regressão de repasse e o teste de Granger ficam num módulo próprio, sem Spark, para serem testados localmente.
 
 * **`repasse_acumulado`:** estima a regressão com erros-padrão HAC (Newey-West) e testa se a elasticidade acumulada, a soma dos coeficientes, é diferente de zero. O erro-padrão da soma é $\sqrt{r' V r}$ sobre a matriz de covariância HAC completa, que inclui as covariâncias entre os coeficientes, e não a soma dos erros-padrão individuais. Também devolve o p-valor (teste z, bicaudal) e o intervalo de confiança de 95%.
+* **`curva_de_repasse`:** usa a mesma regressão e soma os coeficientes só até cada defasagem (0, 1, ..., 4 meses), com erro-padrão e intervalo de 95% calculados da mesma forma. Mostra em quantos meses o repasse acontece. A última linha é a elasticidade de `repasse_acumulado`.
 * **`granger_por_lag`:** reproduz o `ssr_ftest` do `grangercausalitytests` do statsmodels (os testes conferem os números), mas antes coloca a série no calendário mensal completo. Assim, as observações cujas defasagens cairiam num mês ausente são descartadas, em vez de as linhas vizinhas serem tratadas como meses seguidos.
 
 ```python
@@ -415,6 +422,32 @@ def granger_por_lag(
     return pd.DataFrame(linhas).set_index("lag")
 
 
+def _ajustar_defasagens(df: pd.DataFrame, y: str, cols: list[str], hac_maxlags: int):
+    dados = df[[y] + cols].dropna()
+    n_parametros = len(cols) + 1
+    if len(dados) <= n_parametros:
+        raise ValueError(
+            f"Observações insuficientes ({len(dados)}) para estimar {n_parametros} parâmetros."
+        )
+    X = sm.add_constant(dados[cols], has_constant="add")
+    return sm.OLS(dados[y], X).fit(cov_type="HAC", cov_kwds={"maxlags": hac_maxlags})
+
+
+def _testar_soma(modelo, cols_somadas: list[str]) -> dict[str, float]:
+    """Soma dos coeficientes de `cols_somadas`, com erro-padrão sqrt(r' V r) da covariância HAC."""
+    contraste = np.array([1.0 if nome in cols_somadas else 0.0 for nome in modelo.params.index])
+    teste = modelo.t_test(contraste)
+    ic_inf, ic_sup = np.asarray(teste.conf_int(alpha=0.05)).ravel()
+    return {
+        "soma": float(np.asarray(teste.effect).item()),
+        "erro_padrao": float(np.asarray(teste.sd).item()),
+        "estatistica": float(np.asarray(teste.tvalue).item()),
+        "p_valor": float(np.asarray(teste.pvalue).item()),
+        "ic95_inf": float(ic_inf),
+        "ic95_sup": float(ic_sup),
+    }
+
+
 def repasse_acumulado(
     df: pd.DataFrame,
     y: str,
@@ -430,30 +463,48 @@ def repasse_acumulado(
 
     As linhas de `df` devem estar em ordem cronológica, porque o HAC usa a ordem das linhas.
     """
-    dados = df[[y] + cols].dropna()
-    n_parametros = len(cols) + 1
-    if len(dados) <= n_parametros:
-        raise ValueError(
-            f"Observações insuficientes ({len(dados)}) para estimar {n_parametros} parâmetros."
-        )
-
-    X = sm.add_constant(dados[cols], has_constant="add")
-    modelo = sm.OLS(dados[y], X).fit(cov_type="HAC", cov_kwds={"maxlags": hac_maxlags})
-
-    contraste = np.array([1.0 if nome in cols else 0.0 for nome in modelo.params.index])
-    teste = modelo.t_test(contraste)
-    ic_inf, ic_sup = np.asarray(teste.conf_int(alpha=0.05)).ravel()
-
+    modelo = _ajustar_defasagens(df, y, cols, hac_maxlags)
+    soma = _testar_soma(modelo, cols)
     return {
         "n_obs": int(modelo.nobs),
-        "elasticidade": float(np.asarray(teste.effect).item()),
-        "erro_padrao": float(np.asarray(teste.sd).item()),
-        "estatistica": float(np.asarray(teste.tvalue).item()),
-        "p_valor": float(np.asarray(teste.pvalue).item()),
-        "ic95_inf": float(ic_inf),
-        "ic95_sup": float(ic_sup),
+        "elasticidade": soma["soma"],
+        "erro_padrao": soma["erro_padrao"],
+        "estatistica": soma["estatistica"],
+        "p_valor": soma["p_valor"],
+        "ic95_inf": soma["ic95_inf"],
+        "ic95_sup": soma["ic95_sup"],
         "r2_ajustado": float(modelo.rsquared_adj),
     }
+
+
+def curva_de_repasse(
+    df: pd.DataFrame,
+    y: str,
+    cols: list[str],
+    hac_maxlags: int = 3,
+) -> pd.DataFrame:
+    """Elasticidade acumulada até cada defasagem, na mesma regressão de `repasse_acumulado`.
+
+    `cols` deve vir em ordem de defasagem (mesmo mês, 1 mês, 2 meses...). A linha `defasagem = h`
+    soma os coeficientes de `cols[0]` a `cols[h]`, com erro-padrão e IC de 95% da covariância
+    HAC completa. A última linha é a elasticidade de `repasse_acumulado`.
+    """
+    modelo = _ajustar_defasagens(df, y, cols, hac_maxlags)
+    linhas = []
+    for h, col in enumerate(cols):
+        soma = _testar_soma(modelo, cols[: h + 1])
+        linhas.append(
+            {
+                "defasagem": h,
+                "coeficiente": float(modelo.params[col]),
+                "acumulado": soma["soma"],
+                "erro_padrao": soma["erro_padrao"],
+                "p_valor": soma["p_valor"],
+                "ic95_inf": soma["ic95_inf"],
+                "ic95_sup": soma["ic95_sup"],
+            }
+        )
+    return pd.DataFrame(linhas).set_index("defasagem")
 
 
 def p_valor_bonferroni(p_valores: Iterable[float]) -> float:
@@ -632,6 +683,311 @@ def com_retentativas(
     raise AssertionError("inalcançável")
 ```
 
+### Gráficos (`src/soja_alimentos/graficos.py`)
+
+Funções em Matplotlib, com backend `Agg`, que funcionam no Databricks e localmente. Cada uma grava um PNG e devolve o caminho. O notebook 03 mostra as figuras e as registra no run do MLflow, em `figuras/`.
+
+* **`soja_e_alimentos`:** a soja em R$/saca e um índice acumulado de cada subitem, com a soja na mesma base (jan/2020 = 100). Um mês sem dado interrompe o índice, em vez de pular a variação que falta.
+* **`elasticidade_por_subitem`:** a elasticidade acumulada em até 4 meses e o intervalo de 95% de cada subitem. Em laranja, os intervalos que não incluem zero.
+* **`curvas_de_repasse`:** a curva de repasse de cada subitem, de 0 a 4 meses, com a faixa de 95%.
+* **`granger_p_valores`:** os p-valores do Granger em escala log, com as linhas de 5% e do limite de Bonferroni.
+
+```python
+"""Gráficos em Matplotlib dos resultados (funcionam local e no Databricks)."""
+from collections.abc import Iterable
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from matplotlib.ticker import FixedLocator, FuncFormatter, MaxNLocator, NullLocator  # noqa: E402
+
+ROTULOS = {
+    "oleo_soja": "Óleo de soja",
+    "carnes": "Carnes",
+    "frango_inteiro": "Frango inteiro",
+    "frango_pedacos": "Frango em pedaços",
+    "ovo_galinha": "Ovo de galinha",
+}
+CORES_SUBITEM = {
+    "oleo_soja": "#e6ab02",
+    "carnes": "#d95f02",
+    "frango_inteiro": "#1b9e77",
+    "frango_pedacos": "#66a61e",
+    "ovo_galinha": "#7570b3",
+}
+COR_SOJA, COR_DESTAQUE, COR_NEUTRA = "#8c6d1f", "#d95f02", "#555555"
+RODAPE = {"fontsize": 7.5, "color": COR_NEUTRA}
+FONTE = "Fontes: Yahoo Finance (ZS=F e USDBRL=X) e IBGE/SIDRA, tabela 7060. Elaboração própria."
+
+
+def _br(valor: float, casas: int = 2) -> str:
+    """Número com vírgula decimal."""
+    return f"{valor:.{casas}f}".replace(".", ",")
+
+
+def _rotulo(subitem: str) -> str:
+    return ROTULOS.get(subitem, subitem)
+
+
+def _ordenar(subitens: Iterable[str]) -> list[str]:
+    """Ordem fixa dos subitens conhecidos; os demais vão no fim, em ordem alfabética."""
+    subitens = list(subitens)
+    conhecidos = [s for s in ROTULOS if s in subitens]
+    return conhecidos + sorted(s for s in subitens if s not in ROTULOS)
+
+
+def _virgula(casas: int) -> FuncFormatter:
+    return FuncFormatter(lambda v, _: _br(v, casas))
+
+
+def _eixo_decimal(eixo, casas: int = 1) -> None:
+    """Marcas em passos de 1, 2 ou 5 (nunca 2,5, que com uma casa decimal viraria "0,2")."""
+    eixo.set_major_locator(MaxNLocator(steps=[1, 2, 5, 10]))
+    eixo.set_major_formatter(_virgula(casas))
+
+
+def _salvar(fig, pasta: Path, nome: str) -> Path:
+    pasta.mkdir(parents=True, exist_ok=True)
+    caminho = pasta / nome
+    fig.savefig(caminho, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return caminho
+
+
+def _indice(log_ret: pd.Series, base: pd.Timestamp) -> pd.Series:
+    """Índice com base 100 no mês `base`, a partir de log-retornos mensais em %.
+
+    Um mês sem dado interrompe o índice dali em diante, em vez de pular a variação.
+    """
+    nivel = 100 * np.exp(log_ret.cumsum(skipna=False) / 100)
+    return pd.concat([pd.Series([100.0], index=[base]), nivel])
+
+
+def soja_e_alimentos(gold: pd.DataFrame, pasta: Path) -> Path:
+    """Soja em R$/saca e índice acumulado de cada subitem do IPCA, com a soja na mesma base.
+
+    `gold`: a tabela Gold em pandas (`mes`, `subitem`, `soja_brl_saca`, `soja_brl_log_ret`,
+    `ipca_log_ret`).
+    """
+    dados = gold.assign(mes=pd.to_datetime(gold["mes"]))
+    soja = dados.drop_duplicates("mes").set_index("mes").sort_index()
+    calendario = pd.date_range(soja.index.min(), soja.index.max(), freq="MS")
+    soja = soja.reindex(calendario)
+    base = calendario[0] - pd.DateOffset(months=1)
+
+    fig, (ax_nivel, ax_indice) = plt.subplots(
+        2, 1, figsize=(11, 8.5), sharex=True, gridspec_kw={"height_ratios": [1, 1.7]}
+    )
+    ax_nivel.plot(soja.index, soja["soja_brl_saca"], color=COR_SOJA, linewidth=2)
+    ax_nivel.set_title("Soja em reais (média mensal)", loc="left", fontsize=10.5)
+    ax_nivel.set_ylabel("R\\$ por saca de 60 kg")
+    ax_nivel.yaxis.set_major_formatter(_virgula(0))
+
+    indice_soja = _indice(soja["soja_brl_log_ret"], base)
+    ax_indice.plot(
+        indice_soja.index,
+        indice_soja,
+        color=COR_SOJA,
+        linewidth=2,
+        linestyle="--",
+        label=f"Soja em reais ({indice_soja.iloc[-1] - 100:+.0f}%)",
+    )
+    for subitem in _ordenar(dados["subitem"].unique()):
+        serie = dados[dados["subitem"] == subitem].set_index("mes")["ipca_log_ret"]
+        indice = _indice(serie.reindex(calendario), base)
+        ax_indice.plot(
+            indice.index,
+            indice,
+            color=CORES_SUBITEM.get(subitem, COR_NEUTRA),
+            linewidth=1.8,
+            label=f"{_rotulo(subitem)} ({indice.iloc[-1] - 100:+.0f}%)",
+        )
+    ax_indice.axhline(100, color="black", linewidth=0.6)
+    ax_indice.set_title(
+        f"Índice de preços, {base:%m/%Y} = 100 (entre parênteses, a variação no período)",
+        loc="left",
+        fontsize=10.5,
+    )
+    ax_indice.set_ylabel("índice")
+    ax_indice.legend(loc="upper left", fontsize=8.5, frameon=False)
+    for ax in (ax_nivel, ax_indice):
+        ax.grid(alpha=0.3)
+
+    fig.suptitle(
+        "Soja em reais e preços de alimentos no IPCA",
+        x=0.01,
+        ha="left",
+        fontsize=13,
+        fontweight="bold",
+    )
+    fig.text(0.01, 0.005, FONTE, **RODAPE)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.96))
+    return _salvar(fig, pasta, "soja_e_alimentos.png")
+
+
+def elasticidade_por_subitem(reps: dict[str, dict], pasta: Path) -> Path:
+    """Elasticidade acumulada em até 4 meses e IC de 95% de cada subitem.
+
+    `reps`: {subitem: resultado de `analise.repasse_acumulado`}.
+    """
+    ordem = sorted(reps, key=lambda s: reps[s]["elasticidade"])
+    fig, ax = plt.subplots(figsize=(9.5, 1.9 + 0.75 * len(ordem)))
+    for i, subitem in enumerate(ordem):
+        r = reps[subitem]
+        exclui_zero = r["ic95_inf"] > 0 or r["ic95_sup"] < 0
+        cor = COR_DESTAQUE if exclui_zero else COR_NEUTRA
+        ax.plot([r["ic95_inf"], r["ic95_sup"]], [i, i], color=cor, linewidth=3, alpha=0.45)
+        ax.scatter(r["elasticidade"], i, color=cor, s=60, zorder=3)
+        ax.text(
+            r["ic95_sup"],
+            i,
+            f"   {_br(r['elasticidade'])}  (p = {_br(r['p_valor'], 3)})",
+            va="center",
+            fontsize=9,
+        )
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_yticks(range(len(ordem)))
+    ax.set_yticklabels([_rotulo(s) for s in ordem])
+    menor = min(r["ic95_inf"] for r in reps.values())
+    maior = max(r["ic95_sup"] for r in reps.values())
+    ax.set_xlim(min(menor, 0) - 0.1 * (maior - menor), maior + 0.5 * (maior - menor))
+    ax.set_ylim(-0.6, len(ordem) - 0.4)
+    _eixo_decimal(ax.xaxis)
+    ax.set_xlabel("alta acumulada do subitem (%) para cada 1% de alta da soja em reais")
+    ax.grid(axis="x", alpha=0.3)
+    ax.set_title(
+        "Quanto da soja chega aos alimentos em até 4 meses",
+        loc="left",
+        fontsize=13,
+        fontweight="bold",
+    )
+    n_obs = sorted({int(r["n_obs"]) for r in reps.values()})
+    meses = f"{n_obs[0]}" if len(n_obs) == 1 else f"{n_obs[0]} a {n_obs[-1]}"
+    fig.text(
+        0.01,
+        0.005,
+        "Ponto: soma dos coeficientes das defasagens de 0 a 4 meses. Barra: intervalo de 95% com "
+        "erros-padrão de Newey-West.\n"
+        f"Em laranja, os intervalos que não incluem zero. {meses} meses por subitem. {FONTE}",
+        **RODAPE,
+    )
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    return _salvar(fig, pasta, "elasticidade_acumulada.png")
+
+
+def curvas_de_repasse(curvas: dict[str, pd.DataFrame], pasta: Path) -> Path:
+    """Elasticidade acumulada até cada defasagem, com IC de 95%, um painel por subitem.
+
+    `curvas`: {subitem: resultado de `analise.curva_de_repasse`}.
+    """
+    subitens = _ordenar(curvas)
+    fig, eixos = plt.subplots(
+        1, len(subitens), figsize=(3.1 * len(subitens), 4.1), sharey=True, squeeze=False
+    )
+    for ax, subitem in zip(eixos[0], subitens):
+        curva = curvas[subitem]
+        meses = curva.index.to_numpy()
+        cor = CORES_SUBITEM.get(subitem, COR_DESTAQUE)
+        ax.fill_between(meses, curva["ic95_inf"], curva["ic95_sup"], color=cor, alpha=0.18, linewidth=0)
+        ax.plot(meses, curva["acumulado"], color=cor, linewidth=2, marker="o", markersize=4)
+        ax.axhline(0, color="black", linewidth=0.6)
+        ax.set_title(_rotulo(subitem), loc="left", fontsize=10.5, fontweight="bold")
+        ax.set_xticks(meses)
+        ax.set_xlabel("meses depois")
+        ax.grid(alpha=0.3)
+    _eixo_decimal(eixos[0][0].yaxis)
+    eixos[0][0].set_ylabel("alta acumulada do subitem (%)\npara cada 1% de alta da soja")
+    fig.suptitle(
+        "Em quantos meses a soja chega aos alimentos",
+        x=0.01,
+        ha="left",
+        fontsize=13,
+        fontweight="bold",
+    )
+    fig.text(
+        0.01,
+        0.005,
+        "Linha: soma dos coeficientes até cada defasagem (0 = mesmo mês), na mesma regressão da "
+        "elasticidade acumulada. Faixa: intervalo de 95% (Newey-West). " + FONTE,
+        **RODAPE,
+    )
+    fig.tight_layout(rect=(0, 0.03, 1, 0.93))
+    return _salvar(fig, pasta, "curvas_de_repasse.png")
+
+
+def granger_p_valores(granger: dict[str, pd.Series], pasta: Path, alfa: float = 0.05) -> Path:
+    """p-valores do teste de Granger por subitem e número de defasagens, em escala log.
+
+    `granger`: {subitem: p-valores indexados pela defasagem, como `granger_por_lag(...)["p_valor"]`}.
+    """
+    subitens = _ordenar(granger)[::-1]  # o primeiro fica no alto
+    defasagens = list(granger[subitens[0]].index)
+    limite = alfa / len(defasagens)
+    cores = plt.get_cmap("viridis")(np.linspace(0.1, 0.8, len(defasagens)))
+    marcadores = ["o", "s", "^", "D", "v", "P"]
+    menor_p = min(float(granger[s].min()) for s in subitens)
+    x_min = min(0.001, menor_p / 2)
+
+    fig, ax = plt.subplots(figsize=(10, 2.2 + 0.62 * len(subitens)))
+    ax.axvspan(x_min, limite, color=COR_DESTAQUE, alpha=0.08, linewidth=0)
+    ax.axvline(limite, color=COR_DESTAQUE, linewidth=1.2)
+    ax.axvline(alfa, color=COR_NEUTRA, linewidth=1, linestyle="--")
+    topo = len(subitens) - 0.45
+    ax.text(
+        limite,
+        topo,
+        f" {_br(100 * limite, 2)}%\n (Bonferroni)",
+        color=COR_DESTAQUE,
+        fontsize=8,
+        va="bottom",
+    )
+    ax.text(alfa, topo, f" {_br(100 * alfa, 0)}%", color=COR_NEUTRA, fontsize=8, va="bottom")
+    deslocamento = np.linspace(-0.22, 0.22, len(defasagens))
+    for j, (k, cor) in enumerate(zip(defasagens, cores)):
+        ax.scatter(
+            [float(granger[s].loc[k]) for s in subitens],
+            np.arange(len(subitens)) + deslocamento[j],
+            color=cor,
+            marker=marcadores[j % len(marcadores)],
+            s=42,
+            zorder=3,
+            label="soja do mês anterior" if k == 1 else f"soja de 1 a {k} meses antes",
+        )
+    ax.set_xscale("log")
+    ax.set_xlim(x_min, 1.05)
+    marcas = [m for m in (0.001, 0.01, 0.05, 0.1, 0.5, 1) if m >= x_min]
+    ax.xaxis.set_major_locator(FixedLocator(marcas))
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}".replace(".", ",")))
+    ax.set_xlabel("p-valor (escala log): quanto mais à esquerda, mais forte a evidência")
+    ax.set_yticks(range(len(subitens)))
+    ax.set_yticklabels([_rotulo(s) for s in subitens])
+    ax.set_ylim(-0.6, len(subitens) + 0.2)
+    ax.grid(axis="x", alpha=0.3)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), fontsize=8.5, frameon=False)
+    ax.set_title(
+        "A soja antecede os alimentos? Teste de Granger",
+        loc="left",
+        fontsize=13,
+        fontweight="bold",
+    )
+    fig.text(
+        0.01,
+        0.005,
+        "Teste F de que os meses anteriores da soja ajudam a prever o subitem. Com "
+        f"{len(defasagens)} testes por subitem, o limite de {_br(100 * alfa, 0)}% corrigido por "
+        f"Bonferroni é {_br(100 * limite, 2)}%.\nPrecedência no tempo não é causalidade econômica. "
+        + FONTE,
+        **RODAPE,
+    )
+    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    return _salvar(fig, pasta, "granger_p_valores.png")
+```
+
 ---
 
 ## 3. Notebook `notebooks/02_silver_gold_transformacoes.py`
@@ -688,6 +1044,8 @@ print("Camadas Silver e Gold atualizadas com sucesso.")
 
 Lê a tabela Gold, executa a **regressão de repasse acumulado (OLS com erros robustos HAC / Newey-West)** e o **teste de causalidade de Granger** para cada subitem, registrando os resultados no **MLflow**. A elasticidade acumulada vem com erro-padrão HAC, p-valor e intervalo de confiança de 95%. O Granger informa o p-valor de cada defasagem e o menor deles corrigido por Bonferroni.
 
+No fim, gera os quatro gráficos de `graficos.py` e a tabela-resumo em CSV, mostra tudo no notebook e registra os arquivos no run do MLflow, em **Artifacts → figuras**.
+
 ```python
 # Databricks notebook source
 # MAGIC %pip install -q -r ../requirements.txt
@@ -695,7 +1053,9 @@ Lê a tabela Gold, executa a **regressão de repasse acumulado (OLS com erros ro
 # COMMAND ----------
 
 import os
+import shutil
 import sys
+from pathlib import Path
 
 # Num Git folder do Databricks, a raiz do repositório entra no sys.path, mas `src/` não.
 # Desde o DBR 14, o diretório de trabalho do notebook é a pasta dele (notebooks/).
@@ -705,8 +1065,12 @@ if SRC_DIR not in sys.path:
 
 import mlflow  # noqa: E402
 import pandas as pd  # noqa: E402
+from IPython.display import Image  # noqa: E402
+from IPython.display import display as mostrar  # noqa: E402
 
+from soja_alimentos import graficos  # noqa: E402
 from soja_alimentos.analise import (  # noqa: E402
+    curva_de_repasse,
     granger_por_lag,
     p_valor_bonferroni,
     repasse_acumulado,
@@ -727,7 +1091,11 @@ pdf = (
 mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment("/Shared/soja_alimentos_analise")
 
+FIGURAS = Path("/tmp/soja_alimentos_figuras")
+shutil.rmtree(FIGURAS, ignore_errors=True)  # só as figuras desta execução vão para o MLflow
+
 resumos = []
+reps, curvas, granger = {}, {}, {}
 
 with mlflow.start_run(run_name="repasse_hac_e_granger"):
     for subitem, grp in pdf.groupby("subitem"):
@@ -738,6 +1106,9 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         #    Os lags da Gold já vêm nulos quando cairiam num buraco do calendário.
         lag_cols = ["soja_brl_log_ret"] + [f"soja_log_ret_lag_{k}m" for k in range(1, 5)]
         rep = repasse_acumulado(grp, y="ipca_log_ret", cols=lag_cols, hac_maxlags=3)
+        # A mesma regressão, somando só até cada defasagem: em quantos meses o repasse acontece.
+        curvas[subitem] = curva_de_repasse(grp, y="ipca_log_ret", cols=lag_cols, hac_maxlags=3)
+        reps[subitem] = rep
 
         # 2. Granger (Soja -> Subitem IPCA) por defasagem, no calendário mensal completo:
         #    meses ausentes não são tratados como consecutivos.
@@ -746,6 +1117,7 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         )
         # Escolher o menor p entre várias defasagens infla o falso positivo: corrige por Bonferroni.
         p_bonf = p_valor_bonferroni(gc["p_valor"])
+        granger[subitem] = gc["p_valor"]
 
         mlflow.log_metric(f"{subitem}_elasticidade_4m", rep["elasticidade"])
         mlflow.log_metric(f"{subitem}_elasticidade_4m_ep", rep["erro_padrao"])
@@ -774,6 +1146,18 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
 
     df_resumo = pd.DataFrame(resumos).set_index("subitem")
     display(df_resumo)
+
+    # Gráficos: aparecem aqui e ficam no run do MLflow (Artifacts → figuras), com a tabela-resumo.
+    caminhos = [
+        graficos.soja_e_alimentos(pdf, FIGURAS),
+        graficos.elasticidade_por_subitem(reps, FIGURAS),
+        graficos.curvas_de_repasse(curvas, FIGURAS),
+        graficos.granger_p_valores(granger, FIGURAS),
+    ]
+    df_resumo.to_csv(FIGURAS / "resumo_por_subitem.csv")
+    mlflow.log_artifacts(str(FIGURAS), artifact_path="figuras")
+    for caminho in caminhos:
+        mostrar(Image(filename=str(caminho)))
 ```
 
 ---
@@ -799,12 +1183,16 @@ Os testes rodam localmente com `pytest`, sem Databricks. A `SparkSession` local 
 | `test_ipca_recusa_resposta_desatualizada` | Último valor divulgado com mais de 2 meses de atraso é recusado, e meses listados sem valor (`...`) não contam. |
 | `test_com_retentativas_espera_cada_vez_mais_e_devolve_o_resultado` | Depois de duas falhas, a terceira tentativa devolve o resultado, com esperas de 60 e 120 segundos. |
 | `test_com_retentativas_repassa_o_ultimo_erro` | Quando todas as tentativas falham, o erro da última sobe sem alteração. |
+| `test_graficos_geram_um_png_cada` | Cada função de `graficos.py` grava um PNG válido, nenhum arquivo a mais, e não deixa figuras abertas na memória. |
+| `test_indice_parte_de_100_e_para_num_mes_ausente` | O índice dos gráficos começa em 100 e é interrompido num mês sem dado, em vez de pular a variação. |
+| `test_ordem_e_rotulos_dos_subitens` | Ordem fixa dos subitens, nomes por extenso e vírgula decimal. |
 | `test_granger_sem_buracos_igual_statsmodels` | Sem buracos, a estatística F e o p-valor batem com o `grangercausalitytests` do statsmodels em todas as defasagens. |
 | `test_granger_descarta_observacoes_que_atravessam_buraco` | Com um mês ausente, esse mês e as `p` observações seguintes saem da amostra. |
 | `test_granger_amostra_insuficiente_falha_com_mensagem` | Amostra pequena demais gera um erro claro, e não um resultado sem sentido. |
 | `test_reindexar_rejeita_meses_duplicados_ou_fora_do_dia_1` | Entrada mal formada (dois subitens misturados, data fora do dia 1) é recusada. |
 | `test_repasse_soma_e_erro_padrao_usam_covariancia_hac_completa` | A elasticidade é a soma dos coeficientes, e o erro-padrão usa a covariância HAC completa, conferida contra o statsmodels. Numa série sintética com soma verdadeira 0,5, o intervalo de 95% contém 0,5 e exclui zero. |
 | `test_repasse_descarta_linhas_incompletas_e_amostra_insuficiente` | Linhas com lag nulo saem da regressão, e amostra pequena demais gera erro claro. |
+| `test_curva_de_repasse_acumula_coeficientes_e_termina_na_elasticidade` | A curva soma os coeficientes conferidos contra o statsmodels, começa no erro-padrão do próprio coeficiente e termina na elasticidade, com o mesmo IC. Numa série sintética, recupera os efeitos verdadeiros de 0,3 e 0,5. |
 | `test_p_valor_bonferroni` | Correção de Bonferroni com teto em 1, recusando lista vazia ou com `NaN`. |
 
 ### Como rodar os testes
