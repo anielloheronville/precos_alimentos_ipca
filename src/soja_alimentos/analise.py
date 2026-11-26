@@ -68,6 +68,47 @@ def granger_por_lag(
     return pd.DataFrame(linhas).set_index("lag")
 
 
+def repasse_acumulado(
+    df: pd.DataFrame,
+    y: str,
+    cols: list[str],
+    hac_maxlags: int = 3,
+) -> dict[str, float]:
+    """Regressão de defasagens distribuídas com erros-padrão HAC (Newey-West) e teste da soma.
+
+    A elasticidade acumulada é a soma dos coeficientes de `cols`. Seu erro-padrão vem da
+    matriz de covariância HAC completa (sqrt(r' V r)), que inclui as covariâncias entre os
+    coeficientes, e não da soma dos erros-padrão individuais. Com covariância robusta, o
+    statsmodels usa a distribuição normal: `estatistica` é um z e o p-valor é bicaudal.
+
+    As linhas de `df` devem estar em ordem cronológica, porque o HAC usa a ordem das linhas.
+    """
+    dados = df[[y] + cols].dropna()
+    n_parametros = len(cols) + 1
+    if len(dados) <= n_parametros:
+        raise ValueError(
+            f"Observações insuficientes ({len(dados)}) para estimar {n_parametros} parâmetros."
+        )
+
+    X = sm.add_constant(dados[cols], has_constant="add")
+    modelo = sm.OLS(dados[y], X).fit(cov_type="HAC", cov_kwds={"maxlags": hac_maxlags})
+
+    contraste = np.array([1.0 if nome in cols else 0.0 for nome in modelo.params.index])
+    teste = modelo.t_test(contraste)
+    ic_inf, ic_sup = np.asarray(teste.conf_int(alpha=0.05)).ravel()
+
+    return {
+        "n_obs": int(modelo.nobs),
+        "elasticidade": float(np.asarray(teste.effect).item()),
+        "erro_padrao": float(np.asarray(teste.sd).item()),
+        "estatistica": float(np.asarray(teste.tvalue).item()),
+        "p_valor": float(np.asarray(teste.pvalue).item()),
+        "ic95_inf": float(ic_inf),
+        "ic95_sup": float(ic_sup),
+        "r2_ajustado": float(modelo.rsquared_adj),
+    }
+
+
 def p_valor_bonferroni(p_valores: Iterable[float]) -> float:
     """Menor p-valor corrigido por Bonferroni (multiplicado pelo número de testes, teto 1)."""
     p = np.asarray(list(p_valores), dtype=float)

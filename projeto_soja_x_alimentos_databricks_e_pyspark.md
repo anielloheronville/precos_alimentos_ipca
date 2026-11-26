@@ -14,7 +14,7 @@ preços_alimentos_ipca/
 │   └── soja_alimentos/
 │       ├── __init__.py
 │       ├── transforms.py        (PySpark: Silver e Gold)
-│       └── analise.py           (pandas/statsmodels: Granger e Bonferroni)
+│       └── analise.py           (pandas/statsmodels: repasse HAC, Granger e Bonferroni)
 ├── tests/
 │   ├── conftest.py              (SparkSession local + correção de caminho no Windows)
 │   ├── test_soja_pipeline.py
@@ -291,7 +291,10 @@ def build_gold_features(
 
 ### Análises em pandas (`src/soja_alimentos/analise.py`)
 
-O teste de Granger fica num módulo próprio, sem Spark, para ser testado localmente. Ele reproduz o `ssr_ftest` do `grangercausalitytests` do statsmodels (os testes conferem os números), mas antes coloca a série no calendário mensal completo. Assim, as observações cujas defasagens cairiam num mês ausente são descartadas, em vez de as linhas vizinhas serem tratadas como meses seguidos.
+A regressão de repasse e o teste de Granger ficam num módulo próprio, sem Spark, para serem testados localmente.
+
+* **`repasse_acumulado`:** estima a regressão com erros-padrão HAC (Newey-West) e testa se a elasticidade acumulada, a soma dos coeficientes, é diferente de zero. O erro-padrão da soma é $\sqrt{r' V r}$ sobre a matriz de covariância HAC completa, que inclui as covariâncias entre os coeficientes, e não a soma dos erros-padrão individuais. Também devolve o p-valor (teste z, bicaudal) e o intervalo de confiança de 95%.
+* **`granger_por_lag`:** reproduz o `ssr_ftest` do `grangercausalitytests` do statsmodels (os testes conferem os números), mas antes coloca a série no calendário mensal completo. Assim, as observações cujas defasagens cairiam num mês ausente são descartadas, em vez de as linhas vizinhas serem tratadas como meses seguidos.
 
 ```python
 """Testes econométricos sobre a tabela Gold (pandas + statsmodels, sem Spark)."""
@@ -364,6 +367,47 @@ def granger_por_lag(
     return pd.DataFrame(linhas).set_index("lag")
 
 
+def repasse_acumulado(
+    df: pd.DataFrame,
+    y: str,
+    cols: list[str],
+    hac_maxlags: int = 3,
+) -> dict[str, float]:
+    """Regressão de defasagens distribuídas com erros-padrão HAC (Newey-West) e teste da soma.
+
+    A elasticidade acumulada é a soma dos coeficientes de `cols`. Seu erro-padrão vem da
+    matriz de covariância HAC completa (sqrt(r' V r)), que inclui as covariâncias entre os
+    coeficientes, e não da soma dos erros-padrão individuais. Com covariância robusta, o
+    statsmodels usa a distribuição normal: `estatistica` é um z e o p-valor é bicaudal.
+
+    As linhas de `df` devem estar em ordem cronológica, porque o HAC usa a ordem das linhas.
+    """
+    dados = df[[y] + cols].dropna()
+    n_parametros = len(cols) + 1
+    if len(dados) <= n_parametros:
+        raise ValueError(
+            f"Observações insuficientes ({len(dados)}) para estimar {n_parametros} parâmetros."
+        )
+
+    X = sm.add_constant(dados[cols], has_constant="add")
+    modelo = sm.OLS(dados[y], X).fit(cov_type="HAC", cov_kwds={"maxlags": hac_maxlags})
+
+    contraste = np.array([1.0 if nome in cols else 0.0 for nome in modelo.params.index])
+    teste = modelo.t_test(contraste)
+    ic_inf, ic_sup = np.asarray(teste.conf_int(alpha=0.05)).ravel()
+
+    return {
+        "n_obs": int(modelo.nobs),
+        "elasticidade": float(np.asarray(teste.effect).item()),
+        "erro_padrao": float(np.asarray(teste.sd).item()),
+        "estatistica": float(np.asarray(teste.tvalue).item()),
+        "p_valor": float(np.asarray(teste.pvalue).item()),
+        "ic95_inf": float(ic_inf),
+        "ic95_sup": float(ic_sup),
+        "r2_ajustado": float(modelo.rsquared_adj),
+    }
+
+
 def p_valor_bonferroni(p_valores: Iterable[float]) -> float:
     """Menor p-valor corrigido por Bonferroni (multiplicado pelo número de testes, teto 1)."""
     p = np.asarray(list(p_valores), dtype=float)
@@ -426,7 +470,7 @@ print("Camadas Silver e Gold atualizadas com sucesso.")
 
 ## 4. Notebook `notebooks/03_analise_mlflow.py`
 
-Lê a tabela Gold, executa a **regressão de repasse acumulado (OLS com erros robustos HAC / Newey-West)** e o **teste de causalidade de Granger** para cada subitem, registrando os resultados no **MLflow**. O Granger informa o p-valor de cada defasagem e o menor deles corrigido por Bonferroni.
+Lê a tabela Gold, executa a **regressão de repasse acumulado (OLS com erros robustos HAC / Newey-West)** e o **teste de causalidade de Granger** para cada subitem, registrando os resultados no **MLflow**. A elasticidade acumulada vem com erro-padrão HAC, p-valor e intervalo de confiança de 95%. O Granger informa o p-valor de cada defasagem e o menor deles corrigido por Bonferroni.
 
 ```python
 # Databricks notebook source
@@ -445,9 +489,12 @@ if SRC_DIR not in sys.path:
 
 import mlflow  # noqa: E402
 import pandas as pd  # noqa: E402
-import statsmodels.api as sm  # noqa: E402
 
-from soja_alimentos.analise import granger_por_lag, p_valor_bonferroni  # noqa: E402
+from soja_alimentos.analise import (  # noqa: E402
+    granger_por_lag,
+    p_valor_bonferroni,
+    repasse_acumulado,
+)
 
 CATALOG = "workspace"
 SCHEMA = "agro"
@@ -470,16 +517,11 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
     for subitem, grp in pdf.groupby("subitem"):
         grp = grp.sort_values("mes").copy()
 
-        # 1. Regressão Distributed Lag (t até t-4) com erros padrão HAC.
+        # 1. Regressão Distributed Lag (t até t-4) com erros padrão HAC. A elasticidade
+        #    acumulada é a soma dos 5 coeficientes, testada contra zero com a covariância HAC.
         #    Os lags da Gold já vêm nulos quando cairiam num buraco do calendário.
         lag_cols = ["soja_brl_log_ret"] + [f"soja_log_ret_lag_{k}m" for k in range(1, 5)]
-        reg_df = grp[["ipca_log_ret"] + lag_cols].dropna()
-
-        X = sm.add_constant(reg_df[lag_cols])
-        modelo = sm.OLS(reg_df["ipca_log_ret"], X).fit(cov_type="HAC", cov_kwds={"maxlags": 3})
-
-        elasticidade_4m = float(modelo.params[lag_cols].sum())
-        r2_adj = float(modelo.rsquared_adj)
+        rep = repasse_acumulado(grp, y="ipca_log_ret", cols=lag_cols, hac_maxlags=3)
 
         # 2. Granger (Soja -> Subitem IPCA) por defasagem, no calendário mensal completo:
         #    meses ausentes não são tratados como consecutivos.
@@ -489,8 +531,12 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         # Escolher o menor p entre várias defasagens infla o falso positivo: corrige por Bonferroni.
         p_bonf = p_valor_bonferroni(gc["p_valor"])
 
-        mlflow.log_metric(f"{subitem}_elasticidade_4m", elasticidade_4m)
-        mlflow.log_metric(f"{subitem}_r2_adj", r2_adj)
+        mlflow.log_metric(f"{subitem}_elasticidade_4m", rep["elasticidade"])
+        mlflow.log_metric(f"{subitem}_elasticidade_4m_ep", rep["erro_padrao"])
+        mlflow.log_metric(f"{subitem}_elasticidade_4m_p", rep["p_valor"])
+        mlflow.log_metric(f"{subitem}_elasticidade_4m_ic95_inf", rep["ic95_inf"])
+        mlflow.log_metric(f"{subitem}_elasticidade_4m_ic95_sup", rep["ic95_sup"])
+        mlflow.log_metric(f"{subitem}_r2_adj", rep["r2_ajustado"])
         for lag, p_valor in gc["p_valor"].items():
             mlflow.log_metric(f"{subitem}_granger_p_lag{lag}", float(p_valor))
         mlflow.log_metric(f"{subitem}_granger_p_bonferroni", p_bonf)
@@ -498,9 +544,13 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         resumos.append(
             {
                 "subitem": subitem,
-                "n_meses": len(reg_df),
-                "elasticidade_acum_4m": round(elasticidade_4m, 4),
-                "r2_ajustado": round(r2_adj, 3),
+                "n_meses": rep["n_obs"],
+                "elasticidade_acum_4m": round(rep["elasticidade"], 4),
+                "erro_padrao_hac": round(rep["erro_padrao"], 4),
+                "p_valor_elasticidade": round(rep["p_valor"], 4),
+                "ic95_inf": round(rep["ic95_inf"], 4),
+                "ic95_sup": round(rep["ic95_sup"], 4),
+                "r2_ajustado": round(rep["r2_ajustado"], 3),
                 **{f"granger_p_lag{lag}": round(float(p), 4) for lag, p in gc["p_valor"].items()},
                 "granger_p_bonferroni": round(p_bonf, 4),
             }
@@ -526,6 +576,8 @@ Os testes rodam localmente com `pytest`, sem Databricks. A `SparkSession` local 
 | `test_granger_descarta_observacoes_que_atravessam_buraco` | Com um mês ausente, esse mês e as `p` observações seguintes saem da amostra. |
 | `test_granger_amostra_insuficiente_falha_com_mensagem` | Amostra pequena demais gera um erro claro, e não um resultado sem sentido. |
 | `test_reindexar_rejeita_meses_duplicados_ou_fora_do_dia_1` | Entrada mal formada (dois subitens misturados, data fora do dia 1) é recusada. |
+| `test_repasse_soma_e_erro_padrao_usam_covariancia_hac_completa` | A elasticidade é a soma dos coeficientes, e o erro-padrão usa a covariância HAC completa, conferida contra o statsmodels. Numa série sintética com soma verdadeira 0,5, o intervalo de 95% contém 0,5 e exclui zero. |
+| `test_repasse_descarta_linhas_incompletas_e_amostra_insuficiente` | Linhas com lag nulo saem da regressão, e amostra pequena demais gera erro claro. |
 | `test_p_valor_bonferroni` | Correção de Bonferroni com teto em 1, recusando lista vazia ou com `NaN`. |
 
 ### Como rodar os testes

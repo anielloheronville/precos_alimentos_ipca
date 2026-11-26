@@ -3,9 +3,16 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
+import statsmodels.api as sm
+from scipy.stats import norm
 from statsmodels.tsa.stattools import grangercausalitytests
 
-from soja_alimentos.analise import granger_por_lag, p_valor_bonferroni, reindexar_mensal
+from soja_alimentos.analise import (
+    granger_por_lag,
+    p_valor_bonferroni,
+    reindexar_mensal,
+    repasse_acumulado,
+)
 
 
 def _serie_sintetica(n_meses: int = 60, seed: int = 42) -> pd.DataFrame:
@@ -61,6 +68,48 @@ def test_reindexar_rejeita_meses_duplicados_ou_fora_do_dia_1():
     df_meio_do_mes = df.assign(mes=[d.replace(day=15) for d in df["mes"]])
     with pytest.raises(ValueError, match="primeiro dia"):
         reindexar_mensal(df_meio_do_mes)
+
+
+def _serie_repasse(n_meses: int = 200, seed: int = 7) -> pd.DataFrame:
+    """y responde a x no mesmo mês (0,3) e no mês seguinte (0,2): soma verdadeira = 0,5."""
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=n_meses + 1)
+    y = 0.3 * x[1:] + 0.2 * x[:-1] + rng.normal(scale=0.5, size=n_meses)
+    return pd.DataFrame({"y": y, "x_lag0": x[1:], "x_lag1": x[:-1]})
+
+
+def test_repasse_soma_e_erro_padrao_usam_covariancia_hac_completa():
+    df = _serie_repasse()
+    cols = ["x_lag0", "x_lag1"]
+    res = repasse_acumulado(df, y="y", cols=cols, hac_maxlags=3)
+
+    referencia = sm.OLS(df["y"], sm.add_constant(df[cols])).fit(
+        cov_type="HAC", cov_kwds={"maxlags": 3}
+    )
+    V = referencia.cov_params().loc[cols, cols].to_numpy()
+
+    assert res["n_obs"] == len(df)
+    assert math.isclose(res["elasticidade"], referencia.params[cols].sum(), rel_tol=1e-12)
+    # sqrt(r' V r) com r = (1, 1): soma de toda a submatriz, covariâncias incluídas
+    assert math.isclose(res["erro_padrao"], math.sqrt(V.sum()), rel_tol=1e-12)
+    assert not math.isclose(res["erro_padrao"], np.sqrt(np.diag(V)).sum(), rel_tol=1e-3)
+    assert math.isclose(res["estatistica"], res["elasticidade"] / res["erro_padrao"], rel_tol=1e-12)
+    assert math.isclose(res["p_valor"], 2 * norm.sf(abs(res["estatistica"])), rel_tol=1e-9)
+    assert math.isclose(res["r2_ajustado"], referencia.rsquared_adj, rel_tol=1e-12)
+
+    # Recupera o efeito verdadeiro: o IC de 95% contém 0,5 e exclui zero
+    assert res["ic95_inf"] < 0.5 < res["ic95_sup"]
+    assert res["ic95_inf"] > 0
+    assert res["p_valor"] < 1e-6
+
+
+def test_repasse_descarta_linhas_incompletas_e_amostra_insuficiente():
+    df = _serie_repasse(n_meses=50)
+    df.loc[:4, "x_lag1"] = np.nan  # como os primeiros meses de um lag na Gold
+    assert repasse_acumulado(df, y="y", cols=["x_lag0", "x_lag1"])["n_obs"] == 45
+
+    with pytest.raises(ValueError, match="insuficientes"):
+        repasse_acumulado(df.head(8), y="y", cols=["x_lag0", "x_lag1"])
 
 
 def test_p_valor_bonferroni():

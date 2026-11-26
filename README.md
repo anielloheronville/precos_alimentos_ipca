@@ -11,7 +11,7 @@ A documentação completa, com todo o código e as decisões de metodologia, est
 - **Soja em R$/saca de 60 kg:** o contrato contínuo da soja na CBOT (`ZS=F`, em centavos de dólar por bushel) vezes o dólar (`USDBRL=X`). A série usa a média mensal dos dias em que os dois mercados abriram.
 - **Inflação de alimentos:** a variação mensal do IPCA (IBGE/SIDRA, tabela 7060) para óleo de soja, carnes, frango inteiro, frango em pedaços e ovo de galinha.
 - **Medidas, para cada subitem:**
-  - a elasticidade de repasse acumulada em até 4 meses, por uma regressão com defasagens de 0 a 4 meses e erros-padrão de Newey-West;
+  - a elasticidade de repasse acumulada em até 4 meses, por uma regressão com defasagens de 0 a 4 meses e erros-padrão de Newey-West, com erro-padrão, p-valor e intervalo de 95% para a soma;
   - o teste de causalidade de Granger para cada defasagem de 1 a 4 meses, com o menor p-valor corrigido por Bonferroni.
 - As duas séries entram como log-retorno mensal em %. Nenhuma variação ou defasagem é calculada atravessando um mês ausente.
 
@@ -65,7 +65,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -v
 ```
 
-São 9 testes. Eles cobrem o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, e o teste de Granger, conferido contra o do statsmodels.
+São 11 testes. Eles cobrem o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, o erro-padrão da elasticidade acumulada e o teste de Granger, conferido contra o do statsmodels.
 
 ## Limitações
 
