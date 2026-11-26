@@ -1,4 +1,8 @@
 # Databricks notebook source
+# MAGIC %pip install -q -r ../requirements.txt
+
+# COMMAND ----------
+
 import unicodedata
 from datetime import datetime, timezone
 

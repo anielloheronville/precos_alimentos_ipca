@@ -84,6 +84,10 @@ Ingere as séries diárias de **Soja CBOT (`ZS=F`)** e **Dólar (`USDBRL=X`)** v
 
 ```python
 # Databricks notebook source
+# MAGIC %pip install -q -r ../requirements.txt
+
+# COMMAND ----------
+
 import unicodedata
 from datetime import datetime, timezone
 
@@ -426,6 +430,10 @@ Lê a tabela Gold, executa a **regressão de repasse acumulado (OLS com erros ro
 
 ```python
 # Databricks notebook source
+# MAGIC %pip install -q -r ../requirements.txt
+
+# COMMAND ----------
+
 import os
 import sys
 
@@ -451,6 +459,9 @@ pdf = (
     .toPandas()
 )
 
+# Sem registry definido, o MLflow tenta lê-lo de `spark.mlflow.modelRegistryUri`, e o serverless
+# (Spark Connect) proíbe essa leitura com CONFIG_NOT_AVAILABLE. Definir o registry evita a consulta.
+mlflow.set_registry_uri("databricks-uc")
 mlflow.set_experiment("/Shared/soja_alimentos_analise")
 
 resumos = []

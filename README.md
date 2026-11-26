@@ -4,7 +4,7 @@ Este estudo mede quanto e com que defasagem a variação do preço da soja em re
 
 A documentação completa, com todo o código e as decisões de metodologia, está em [projeto_soja_x_alimentos_databricks_e_pyspark.md](projeto_soja_x_alimentos_databricks_e_pyspark.md).
 
-**Status:** os testes unitários passam localmente. Os notebooks ainda não foram executados de ponta a ponta no Databricks, então ainda não há resultados publicados.
+**Status:** os testes unitários passam localmente, e os três notebooks rodaram de ponta a ponta na Databricks Free Edition (serverless) em novembro de 2026, com dados de jan/2020 a out/2026.
 
 ## Pergunta e método
 
@@ -49,7 +49,7 @@ requirements-dev.txt    ambiente local de testes
 Requer Databricks Runtime 14 ou mais recente, porque os notebooks importam `src/` a partir da própria pasta.
 
 1. Clone este repositório como Git folder no workspace (**Workspace → Create → Git folder**).
-2. Instale no cluster as bibliotecas do `requirements.txt`: yfinance, requests e statsmodels. Não instale pyspark, pandas, numpy nem mlflow, que já vêm no runtime.
+2. Os notebooks 01 e 03 instalam sozinhos, com `%pip`, as bibliotecas do `requirements.txt`: yfinance, requests e statsmodels. pyspark, pandas, numpy e mlflow já vêm no runtime.
 3. Execute os notebooks em ordem: `01_bronze_ingestao`, `02_silver_gold_transformacoes` e `03_analise_mlflow`.
 
 Os resultados ficam no experimento MLflow `/Shared/soja_alimentos_analise` e numa tabela-resumo no fim do notebook 03.
