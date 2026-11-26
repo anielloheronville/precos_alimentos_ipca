@@ -1,0 +1,1414 @@
+{
+  "datasets": [
+    {
+      "name": "ds_resultados",
+      "displayName": "Resultados do último run (MLflow)",
+      "queryLines": [
+        "WITH execucoes AS (\n",
+        "  SELECT r.run_id, r.experiment_id, r.start_time\n",
+        "  FROM system.mlflow.runs_latest AS r\n",
+        "  JOIN system.mlflow.experiments_latest AS e ON e.experiment_id = r.experiment_id\n",
+        "  WHERE e.name = '/Shared/soja_alimentos_analise'\n",
+        "    AND e.delete_time IS NULL\n",
+        "    AND r.delete_time IS NULL\n",
+        "    AND r.status = 'FINISHED'\n",
+        "),\n",
+        "metricas AS (\n",
+        "  SELECT x.run_id, x.start_time,\n",
+        "         regexp_extract(h.metric_name, '^(.+?)_(elasticidade_4m.*|r2_adj|granger_p_.+)$', 1) AS subitem,\n",
+        "         regexp_extract(h.metric_name, '^(.+?)_(elasticidade_4m.*|r2_adj|granger_p_.+)$', 2) AS medida,\n",
+        "         max_by(h.metric_value, h.metric_step) AS valor\n",
+        "  FROM execucoes AS x\n",
+        "  JOIN system.mlflow.run_metrics_history AS h ON h.experiment_id = x.experiment_id AND h.run_id = x.run_id\n",
+        "  GROUP BY x.run_id, x.start_time, h.metric_name\n",
+        "),\n",
+        "ultimo_run AS (\n",
+        "  SELECT run_id\n",
+        "  FROM metricas\n",
+        "  WHERE subitem <> ''\n",
+        "  ORDER BY start_time DESC\n",
+        "  LIMIT 1\n",
+        "),\n",
+        "largo AS (\n",
+        "  SELECT m.run_id, m.start_time AS executado_em, m.subitem,\n",
+        "         max(CASE WHEN m.medida = 'elasticidade_4m' THEN m.valor END) AS elasticidade,\n",
+        "         max(CASE WHEN m.medida = 'elasticidade_4m_ep' THEN m.valor END) AS erro_padrao,\n",
+        "         max(CASE WHEN m.medida = 'elasticidade_4m_p' THEN m.valor END) AS p_valor,\n",
+        "         max(CASE WHEN m.medida = 'elasticidade_4m_ic95_inf' THEN m.valor END) AS ic95_inf,\n",
+        "         max(CASE WHEN m.medida = 'elasticidade_4m_ic95_sup' THEN m.valor END) AS ic95_sup,\n",
+        "         max(CASE WHEN m.medida = 'r2_adj' THEN m.valor END) AS r2_ajustado,\n",
+        "         max(CASE WHEN m.medida = 'granger_p_lag1' THEN m.valor END) AS granger_p_lag1,\n",
+        "         max(CASE WHEN m.medida = 'granger_p_lag2' THEN m.valor END) AS granger_p_lag2,\n",
+        "         max(CASE WHEN m.medida = 'granger_p_lag3' THEN m.valor END) AS granger_p_lag3,\n",
+        "         max(CASE WHEN m.medida = 'granger_p_lag4' THEN m.valor END) AS granger_p_lag4,\n",
+        "         max(CASE WHEN m.medida = 'granger_p_bonferroni' THEN m.valor END) AS granger_p_bonferroni\n",
+        "  FROM metricas AS m\n",
+        "  JOIN ultimo_run AS u ON u.run_id = m.run_id\n",
+        "  WHERE m.subitem <> ''\n",
+        "  GROUP BY m.run_id, m.start_time, m.subitem\n",
+        ")\n",
+        "SELECT *,\n",
+        "       CASE subitem WHEN 'oleo_soja' THEN 'Óleo de soja' WHEN 'carnes' THEN 'Carnes'\n",
+        "                    WHEN 'frango_inteiro' THEN 'Frango inteiro' WHEN 'frango_pedacos' THEN 'Frango em pedaços'\n",
+        "                    WHEN 'ovo_galinha' THEN 'Ovo de galinha' ELSE subitem END AS nome,\n",
+        "       CASE subitem WHEN 'oleo_soja' THEN 1 WHEN 'carnes' THEN 2 WHEN 'frango_inteiro' THEN 3\n",
+        "                    WHEN 'frango_pedacos' THEN 4 WHEN 'ovo_galinha' THEN 5 ELSE 9 END AS ordem,\n",
+        "       CASE WHEN ic95_inf > 0 OR ic95_sup < 0 THEN 1 ELSE 0 END AS ic_exclui_zero,\n",
+        "       CASE WHEN p_valor < 0.05 / 5 THEN 1 ELSE 0 END AS significativo_bonferroni_5_subitens,\n",
+        "       CASE WHEN granger_p_bonferroni < 0.05 THEN 1 ELSE 0 END AS granger_significativo,\n",
+        "       concat(replace(format_number(round(elasticidade, 2), 2), '.', ','), '  (',\n",
+        "              replace(format_number(round(ic95_inf, 2), 2), '.', ','), ' a ',\n",
+        "              replace(format_number(round(ic95_sup, 2), 2), '.', ','), ')') AS rotulo,\n",
+        "       replace(format_number(p_valor, 3), '.', ',') AS p_rotulo\n",
+        "FROM largo\n",
+        "ORDER BY ordem\n"
+      ]
+    },
+    {
+      "name": "ds_curva",
+      "displayName": "Curva de repasse do último run (MLflow)",
+      "queryLines": [
+        "WITH execucoes AS (\n",
+        "  SELECT r.run_id, r.experiment_id, r.start_time\n",
+        "  FROM system.mlflow.runs_latest AS r\n",
+        "  JOIN system.mlflow.experiments_latest AS e ON e.experiment_id = r.experiment_id\n",
+        "  WHERE e.name = '/Shared/soja_alimentos_analise'\n",
+        "    AND e.delete_time IS NULL\n",
+        "    AND r.delete_time IS NULL\n",
+        "    AND r.status = 'FINISHED'\n",
+        "),\n",
+        "pontos AS (\n",
+        "  SELECT x.run_id, x.start_time,\n",
+        "         regexp_extract(h.metric_name, '^(.+?)_repasse_acumulado(_ep|_p|_ic95_inf|_ic95_sup)?$', 1) AS subitem,\n",
+        "         coalesce(regexp_extract(h.metric_name, '^(.+?)_repasse_acumulado(_ep|_p|_ic95_inf|_ic95_sup)?$', 2), '') AS medida,\n",
+        "         h.metric_step AS defasagem,\n",
+        "         h.metric_value AS valor\n",
+        "  FROM execucoes AS x\n",
+        "  JOIN system.mlflow.run_metrics_history AS h ON h.experiment_id = x.experiment_id AND h.run_id = x.run_id\n",
+        "  WHERE h.metric_name LIKE '%repasse_acumulado%'\n",
+        "),\n",
+        "ultimo_run AS (\n",
+        "  SELECT run_id\n",
+        "  FROM pontos\n",
+        "  WHERE subitem <> ''\n",
+        "  ORDER BY start_time DESC\n",
+        "  LIMIT 1\n",
+        "),\n",
+        "largo AS (\n",
+        "  SELECT p.subitem, p.defasagem,\n",
+        "         max(CASE WHEN p.medida = '' THEN p.valor END) AS acumulado,\n",
+        "         max(CASE WHEN p.medida = '_ep' THEN p.valor END) AS erro_padrao,\n",
+        "         max(CASE WHEN p.medida = '_p' THEN p.valor END) AS p_valor,\n",
+        "         max(CASE WHEN p.medida = '_ic95_inf' THEN p.valor END) AS ic95_inf,\n",
+        "         max(CASE WHEN p.medida = '_ic95_sup' THEN p.valor END) AS ic95_sup\n",
+        "  FROM pontos AS p\n",
+        "  JOIN ultimo_run AS u ON u.run_id = p.run_id\n",
+        "  WHERE p.subitem <> ''\n",
+        "  GROUP BY p.subitem, p.defasagem\n",
+        ")\n",
+        "SELECT subitem, defasagem, acumulado, erro_padrao, p_valor, ic95_inf, ic95_sup,\n",
+        "       CASE subitem WHEN 'oleo_soja' THEN 'Óleo de soja' WHEN 'carnes' THEN 'Carnes'\n",
+        "                    WHEN 'frango_inteiro' THEN 'Frango inteiro' WHEN 'frango_pedacos' THEN 'Frango em pedaços'\n",
+        "                    WHEN 'ovo_galinha' THEN 'Ovo de galinha' ELSE subitem END AS nome,\n",
+        "       CASE subitem WHEN 'oleo_soja' THEN 1 WHEN 'carnes' THEN 2 WHEN 'frango_inteiro' THEN 3\n",
+        "                    WHEN 'frango_pedacos' THEN 4 WHEN 'ovo_galinha' THEN 5 ELSE 9 END AS ordem,\n",
+        "       CASE WHEN ic95_inf > 0 OR ic95_sup < 0 THEN 1 ELSE 0 END AS ic_exclui_zero,\n",
+        "       CASE defasagem WHEN 0 THEN 'no mesmo mês' WHEN 1 THEN 'em até 1 mês'\n",
+        "                      ELSE concat('em até ', defasagem, ' meses') END AS horizonte,\n",
+        "       concat(replace(format_number(round(acumulado, 2), 2), '.', ','), '  (',\n",
+        "              replace(format_number(round(ic95_inf, 2), 2), '.', ','), ' a ',\n",
+        "              replace(format_number(round(ic95_sup, 2), 2), '.', ','), ')') AS rotulo,\n",
+        "       replace(format_number(p_valor, 3), '.', ',') AS p_rotulo\n",
+        "FROM largo\n",
+        "ORDER BY ordem, defasagem\n"
+      ]
+    },
+    {
+      "name": "ds_indices",
+      "displayName": "Índices de preço (Gold)",
+      "queryLines": [
+        "WITH series AS (\n",
+        "  SELECT mes, 'Soja (R$/saca)' AS serie, 0 AS ordem, max(soja_brl_log_ret) AS log_ret\n",
+        "  FROM workspace.agro.gold_soja_alimentos_features\n",
+        "  GROUP BY mes\n",
+        "  UNION ALL\n",
+        "  SELECT mes,\n",
+        "         CASE subitem WHEN 'oleo_soja' THEN 'Óleo de soja' WHEN 'carnes' THEN 'Carnes'\n",
+        "                      WHEN 'frango_inteiro' THEN 'Frango inteiro' WHEN 'frango_pedacos' THEN 'Frango em pedaços'\n",
+        "                      WHEN 'ovo_galinha' THEN 'Ovo de galinha' ELSE subitem END AS serie,\n",
+        "         CASE subitem WHEN 'oleo_soja' THEN 1 WHEN 'carnes' THEN 2 WHEN 'frango_inteiro' THEN 3\n",
+        "                      WHEN 'frango_pedacos' THEN 4 WHEN 'ovo_galinha' THEN 5 ELSE 9 END AS ordem,\n",
+        "         ipca_log_ret AS log_ret\n",
+        "  FROM workspace.agro.gold_soja_alimentos_features\n",
+        "),\n",
+        "acumulado AS (\n",
+        "  SELECT mes, serie, ordem,\n",
+        "         CASE WHEN sum(CASE WHEN log_ret IS NULL THEN 1 ELSE 0 END) OVER w = 0\n",
+        "              THEN 100 * exp(sum(log_ret) OVER w / 100) END AS indice\n",
+        "  FROM series\n",
+        "  WINDOW w AS (PARTITION BY serie ORDER BY mes ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)\n",
+        "),\n",
+        "base AS (\n",
+        "  SELECT add_months(min(mes), -1) AS mes, serie, ordem, CAST(100 AS DOUBLE) AS indice\n",
+        "  FROM series\n",
+        "  GROUP BY serie, ordem\n",
+        "),\n",
+        "indices AS (\n",
+        "  SELECT * FROM base\n",
+        "  UNION ALL\n",
+        "  SELECT * FROM acumulado\n",
+        ")\n",
+        "SELECT mes, serie, ordem, indice,\n",
+        "       max_by(indice, mes) OVER (PARTITION BY serie) / 100 - 1 AS variacao_total,\n",
+        "       max(mes) OVER () AS ultimo_mes\n",
+        "FROM indices\n",
+        "ORDER BY ordem, mes\n"
+      ]
+    },
+    {
+      "name": "ds_execucoes",
+      "displayName": "Histórico de runs (MLflow)",
+      "queryLines": [
+        "WITH execucoes AS (\n",
+        "  SELECT r.run_id, r.experiment_id, r.start_time, r.end_time\n",
+        "  FROM system.mlflow.runs_latest AS r\n",
+        "  JOIN system.mlflow.experiments_latest AS e ON e.experiment_id = r.experiment_id\n",
+        "  WHERE e.name = '/Shared/soja_alimentos_analise'\n",
+        "    AND e.delete_time IS NULL\n",
+        "    AND r.delete_time IS NULL\n",
+        "    AND r.status = 'FINISHED'\n",
+        "),\n",
+        "metricas AS (\n",
+        "  SELECT x.run_id, x.start_time, x.end_time,\n",
+        "         regexp_extract(h.metric_name, '^(.+?)_(elasticidade_4m.*|r2_adj|granger_p_.+)$', 1) AS subitem,\n",
+        "         regexp_extract(h.metric_name, '^(.+?)_(elasticidade_4m.*|r2_adj|granger_p_.+)$', 2) AS medida,\n",
+        "         max_by(h.metric_value, h.metric_step) AS valor\n",
+        "  FROM execucoes AS x\n",
+        "  JOIN system.mlflow.run_metrics_history AS h ON h.experiment_id = x.experiment_id AND h.run_id = x.run_id\n",
+        "  GROUP BY x.run_id, x.start_time, x.end_time, h.metric_name\n",
+        ")\n",
+        "SELECT run_id,\n",
+        "       from_utc_timestamp(start_time, 'America/Sao_Paulo') AS executado_em,\n",
+        "       round((unix_millis(end_time) - unix_millis(start_time)) / 1000, 1) AS duracao_s,\n",
+        "       CASE subitem WHEN 'oleo_soja' THEN 'Óleo de soja' WHEN 'carnes' THEN 'Carnes'\n",
+        "                    WHEN 'frango_inteiro' THEN 'Frango inteiro' WHEN 'frango_pedacos' THEN 'Frango em pedaços'\n",
+        "                    WHEN 'ovo_galinha' THEN 'Ovo de galinha' ELSE subitem END AS nome,\n",
+        "       CASE subitem WHEN 'oleo_soja' THEN 1 WHEN 'carnes' THEN 2 WHEN 'frango_inteiro' THEN 3\n",
+        "                    WHEN 'frango_pedacos' THEN 4 WHEN 'ovo_galinha' THEN 5 ELSE 9 END AS ordem,\n",
+        "       max(CASE WHEN medida = 'elasticidade_4m' THEN valor END) AS elasticidade,\n",
+        "       max(CASE WHEN medida = 'elasticidade_4m_ic95_inf' THEN valor END) AS ic95_inf,\n",
+        "       max(CASE WHEN medida = 'elasticidade_4m_ic95_sup' THEN valor END) AS ic95_sup,\n",
+        "       max(CASE WHEN medida = 'elasticidade_4m_p' THEN valor END) AS p_valor,\n",
+        "       max(CASE WHEN medida = 'granger_p_bonferroni' THEN valor END) AS granger_p_bonferroni\n",
+        "FROM metricas\n",
+        "WHERE subitem <> ''\n",
+        "GROUP BY run_id, start_time, end_time, subitem\n",
+        "ORDER BY executado_em DESC, ordem\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "resultados",
+      "displayName": "Resultados",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "titulo",
+            "multilineTextboxSpec": {
+              "lines": [
+                "# Soja × inflação de alimentos no Brasil\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "subtitulo",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Quanto e em quantos meses a alta da soja em reais chega a cinco subitens do IPCA, de janeiro de 2020 ",
+                "em diante. Os resultados da análise vêm da execução mais recente do notebook 03 registrada no MLflow ",
+                "(experimento `/Shared/soja_alimentos_analise`), e as séries de preço vêm da tabela ",
+                "`gold_soja_alimentos_features`. O job mensal atualiza as duas fontes."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_soja",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_indices",
+                  "fields": [
+                    {
+                      "name": "max(variacao_total)",
+                      "expression": "MAX(`variacao_total`)"
+                    }
+                  ],
+                  "disaggregated": false,
+                  "filters": [
+                    {
+                      "expression": "`serie` = 'Soja (R$/saca)'"
+                    }
+                  ]
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "max(variacao_total)",
+                  "displayName": "Soja em reais desde jan/2020",
+                  "format": {
+                    "type": "number-percent",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 0
+                    }
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Soja em reais desde jan/2020",
+                "showDescription": true,
+                "description": "Média mensal em R$/saca"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_ic_sem_zero",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_resultados",
+                  "fields": [
+                    {
+                      "name": "sum(ic_exclui_zero)",
+                      "expression": "SUM(`ic_exclui_zero`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(ic_exclui_zero)",
+                  "displayName": "Repasse diferente de zero"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Repasse diferente de zero",
+                "showDescription": true,
+                "description": "Subitens com IC de 95% sem o zero"
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_bonferroni",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_resultados",
+                  "fields": [
+                    {
+                      "name": "sum(significativo_bonferroni_5_subitens)",
+                      "expression": "SUM(`significativo_bonferroni_5_subitens`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(significativo_bonferroni_5_subitens)",
+                  "displayName": "Com correção para 5 subitens"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Com correção para 5 subitens",
+                "showDescription": true,
+                "description": "Subitens com p-valor abaixo de 1%"
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "kpi_granger",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_resultados",
+                  "fields": [
+                    {
+                      "name": "sum(granger_significativo)",
+                      "expression": "SUM(`granger_significativo`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(granger_significativo)",
+                  "displayName": "Passam no teste de Granger"
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Passam no teste de Granger",
+                "showDescription": true,
+                "description": "Subitens com p < 5% após Bonferroni"
+              }
+            }
+          },
+          "position": {
+            "x": 9,
+            "y": 3,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "indices",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_indices",
+                  "fields": [
+                    {
+                      "name": "mes",
+                      "expression": "`mes`"
+                    },
+                    {
+                      "name": "indice",
+                      "expression": "`indice`"
+                    },
+                    {
+                      "name": "serie",
+                      "expression": "`serie`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "mes",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Mês"
+                },
+                "y": {
+                  "fieldName": "indice",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Índice (jan/2020 = 100)",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 0
+                    },
+                    "hideGroupSeparator": true
+                  }
+                },
+                "color": {
+                  "fieldName": "serie",
+                  "displayName": "Série",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Soja (R$/saca)",
+                        "color": "#8c6d1f"
+                      },
+                      {
+                        "value": "Óleo de soja",
+                        "color": "#e6ab02"
+                      },
+                      {
+                        "value": "Carnes",
+                        "color": "#d95f02"
+                      },
+                      {
+                        "value": "Frango inteiro",
+                        "color": "#1b9e77"
+                      },
+                      {
+                        "value": "Frango em pedaços",
+                        "color": "#66a61e"
+                      },
+                      {
+                        "value": "Ovo de galinha",
+                        "color": "#7570b3"
+                      }
+                    ]
+                  }
+                }
+              },
+              "annotations": [
+                {
+                  "type": "horizontal-line",
+                  "encodings": {
+                    "y": {
+                      "dataValue": "100",
+                      "dataType": "INTEGER"
+                    },
+                    "label": {
+                      "value": "jan/2020 = 100"
+                    },
+                    "color": {
+                      "value": {
+                        "hex": "#555555"
+                      }
+                    }
+                  }
+                }
+              ],
+              "frame": {
+                "showTitle": true,
+                "title": "Soja e alimentos, índice com jan/2020 = 100",
+                "showDescription": true,
+                "description": "Soja: média mensal em R$/saca de 60 kg. Alimentos: variação acumulada do IPCA de cada subitem."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "elasticidade",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_resultados",
+                  "fields": [
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    },
+                    {
+                      "name": "ordem",
+                      "expression": "`ordem`"
+                    },
+                    {
+                      "name": "elasticidade",
+                      "expression": "`elasticidade`"
+                    },
+                    {
+                      "name": "ic95_inf",
+                      "expression": "`ic95_inf`"
+                    },
+                    {
+                      "name": "ic95_sup",
+                      "expression": "`ic95_sup`"
+                    },
+                    {
+                      "name": "ic_exclui_zero",
+                      "expression": "`ic_exclui_zero`"
+                    },
+                    {
+                      "name": "rotulo",
+                      "expression": "`rotulo`"
+                    },
+                    {
+                      "name": "p_rotulo",
+                      "expression": "`p_rotulo`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "custom-vega-viz",
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "nome"
+                  },
+                  {
+                    "fieldName": "ordem"
+                  },
+                  {
+                    "fieldName": "elasticidade"
+                  },
+                  {
+                    "fieldName": "ic95_inf"
+                  },
+                  {
+                    "fieldName": "ic95_sup"
+                  },
+                  {
+                    "fieldName": "ic_exclui_zero"
+                  },
+                  {
+                    "fieldName": "rotulo"
+                  },
+                  {
+                    "fieldName": "p_rotulo"
+                  }
+                ]
+              },
+              "jsonSpec": {
+                "type": "vega-lite",
+                "spec": "{\"$schema\": \"https://vega.github.io/schema/vega-lite/v6.json\", \"data\": {\"name\": \"databricks_query\"}, \"width\": \"container\", \"height\": \"container\", \"config\": {\"autosize\": {\"type\": \"fit\", \"contains\": \"padding\"}, \"view\": {\"stroke\": null}}, \"transform\": [{\"calculate\": \"datum.ic_exclui_zero == 1 ? 'IC de 95% sem o zero' : 'IC de 95% inclui o zero'\", \"as\": \"leitura\"}, {\"window\": [{\"op\": \"row_number\", \"as\": \"linha\"}]}], \"layer\": [{\"transform\": [{\"filter\": \"datum.linha == 1\"}], \"mark\": {\"type\": \"rule\", \"strokeDash\": [4, 3], \"color\": \"#555555\"}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada em até 4 meses\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"datum\": 0}}}, {\"mark\": {\"type\": \"rule\", \"strokeWidth\": 3}, \"encoding\": {\"y\": {\"field\": \"nome\", \"type\": \"nominal\", \"sort\": {\"field\": \"ordem\", \"op\": \"min\", \"order\": \"ascending\"}, \"title\": null, \"axis\": {\"labelFontSize\": 12, \"labelLimit\": 220, \"ticks\": false, \"domain\": false}}, \"x\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada em até 4 meses\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"ic95_inf\"}, \"x2\": {\"field\": \"ic95_sup\"}, \"color\": {\"field\": \"leitura\", \"type\": \"nominal\", \"scale\": {\"domain\": [\"IC de 95% sem o zero\", \"IC de 95% inclui o zero\"], \"range\": [\"#d95f02\", \"#8a8a8a\"]}, \"legend\": {\"orient\": \"bottom\", \"title\": null}}, \"tooltip\": [{\"field\": \"nome\", \"title\": \"Subitem\"}, {\"field\": \"rotulo\", \"title\": \"Elasticidade (IC de 95%)\"}, {\"field\": \"p_rotulo\", \"title\": \"p-valor\"}]}}, {\"mark\": {\"type\": \"point\", \"filled\": true, \"size\": 110, \"opacity\": 1}, \"encoding\": {\"y\": {\"field\": \"nome\", \"type\": \"nominal\", \"sort\": {\"field\": \"ordem\", \"op\": \"min\", \"order\": \"ascending\"}, \"title\": null, \"axis\": {\"labelFontSize\": 12, \"labelLimit\": 220, \"ticks\": false, \"domain\": false}}, \"x\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada em até 4 meses\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"elasticidade\"}, \"color\": {\"field\": \"leitura\", \"type\": \"nominal\", \"scale\": {\"domain\": [\"IC de 95% sem o zero\", \"IC de 95% inclui o zero\"], \"range\": [\"#d95f02\", \"#8a8a8a\"]}, \"legend\": {\"orient\": \"bottom\", \"title\": null}}, \"tooltip\": [{\"field\": \"nome\", \"title\": \"Subitem\"}, {\"field\": \"rotulo\", \"title\": \"Elasticidade (IC de 95%)\"}, {\"field\": \"p_rotulo\", \"title\": \"p-valor\"}]}}, {\"mark\": {\"type\": \"text\", \"dy\": -13, \"fontSize\": 11}, \"encoding\": {\"y\": {\"field\": \"nome\", \"type\": \"nominal\", \"sort\": {\"field\": \"ordem\", \"op\": \"min\", \"order\": \"ascending\"}, \"title\": null, \"axis\": {\"labelFontSize\": 12, \"labelLimit\": 220, \"ticks\": false, \"domain\": false}}, \"x\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada em até 4 meses\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"elasticidade\"}, \"text\": {\"field\": \"rotulo\"}, \"color\": {\"field\": \"leitura\", \"type\": \"nominal\", \"scale\": {\"domain\": [\"IC de 95% sem o zero\", \"IC de 95% inclui o zero\"], \"range\": [\"#d95f02\", \"#8a8a8a\"]}, \"legend\": {\"orient\": \"bottom\", \"title\": null}}}}]}"
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Elasticidade de repasse em até 4 meses",
+                "showDescription": true,
+                "description": "Alta % do subitem para cada 1% de alta da soja em reais, com o intervalo de 95% (Newey-West)."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "granger",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_resultados",
+                  "fields": [
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    },
+                    {
+                      "name": "ordem",
+                      "expression": "`ordem`"
+                    },
+                    {
+                      "name": "granger_p_lag1",
+                      "expression": "`granger_p_lag1`"
+                    },
+                    {
+                      "name": "granger_p_lag2",
+                      "expression": "`granger_p_lag2`"
+                    },
+                    {
+                      "name": "granger_p_lag3",
+                      "expression": "`granger_p_lag3`"
+                    },
+                    {
+                      "name": "granger_p_lag4",
+                      "expression": "`granger_p_lag4`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "custom-vega-viz",
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "nome"
+                  },
+                  {
+                    "fieldName": "ordem"
+                  },
+                  {
+                    "fieldName": "granger_p_lag1"
+                  },
+                  {
+                    "fieldName": "granger_p_lag2"
+                  },
+                  {
+                    "fieldName": "granger_p_lag3"
+                  },
+                  {
+                    "fieldName": "granger_p_lag4"
+                  }
+                ]
+              },
+              "jsonSpec": {
+                "type": "vega-lite",
+                "spec": "{\"$schema\": \"https://vega.github.io/schema/vega-lite/v6.json\", \"data\": {\"name\": \"databricks_query\"}, \"width\": \"container\", \"height\": \"container\", \"config\": {\"autosize\": {\"type\": \"fit\", \"contains\": \"padding\"}, \"view\": {\"stroke\": null}}, \"transform\": [{\"fold\": [\"granger_p_lag1\", \"granger_p_lag2\", \"granger_p_lag3\", \"granger_p_lag4\"], \"as\": [\"campo\", \"p\"]}, {\"calculate\": \"toNumber(replace(datum.campo, 'granger_p_lag', ''))\", \"as\": \"k\"}, {\"calculate\": \"datum.k == 1 ? 'soja do mês anterior' : 'soja de 1 a ' + datum.k + ' meses antes'\", \"as\": \"defasagens\"}, {\"calculate\": \"replace(format(datum.p, '.3f'), '.', ',')\", \"as\": \"p_rotulo\"}, {\"window\": [{\"op\": \"row_number\", \"as\": \"linha\"}]}], \"layer\": [{\"transform\": [{\"filter\": \"datum.linha == 1\"}], \"mark\": {\"type\": \"rect\", \"color\": \"#d95f02\", \"opacity\": 0.08}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"title\": \"p-valor (escala log): quanto mais à esquerda, mais forte a evidência\", \"axis\": {\"values\": [0.001, 0.01, 0.05, 0.1, 0.5, 1], \"labelExpr\": \"replace(format(datum.value, '~g'), '.', ',')\", \"grid\": true}, \"scale\": {\"type\": \"log\"}, \"datum\": 0.001}, \"x2\": {\"datum\": 0.0125}}}, {\"transform\": [{\"filter\": \"datum.linha == 1\"}], \"mark\": {\"type\": \"rule\", \"color\": \"#d95f02\", \"strokeWidth\": 1.5}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"title\": \"p-valor (escala log): quanto mais à esquerda, mais forte a evidência\", \"axis\": {\"values\": [0.001, 0.01, 0.05, 0.1, 0.5, 1], \"labelExpr\": \"replace(format(datum.value, '~g'), '.', ',')\", \"grid\": true}, \"scale\": {\"type\": \"log\"}, \"datum\": 0.0125}}}, {\"transform\": [{\"filter\": \"datum.linha == 1\"}], \"mark\": {\"type\": \"rule\", \"color\": \"#555555\", \"strokeDash\": [4, 3]}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"title\": \"p-valor (escala log): quanto mais à esquerda, mais forte a evidência\", \"axis\": {\"values\": [0.001, 0.01, 0.05, 0.1, 0.5, 1], \"labelExpr\": \"replace(format(datum.value, '~g'), '.', ',')\", \"grid\": true}, \"scale\": {\"type\": \"log\"}, \"datum\": 0.05}}}, {\"transform\": [{\"filter\": \"datum.linha == 1\"}], \"mark\": {\"type\": \"text\", \"align\": \"right\", \"baseline\": \"top\", \"dx\": -4, \"y\": 2, \"fontSize\": 10, \"color\": \"#d95f02\"}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"title\": \"p-valor (escala log): quanto mais à esquerda, mais forte a evidência\", \"axis\": {\"values\": [0.001, 0.01, 0.05, 0.1, 0.5, 1], \"labelExpr\": \"replace(format(datum.value, '~g'), '.', ',')\", \"grid\": true}, \"scale\": {\"type\": \"log\"}, \"datum\": 0.0125}, \"text\": {\"value\": \"1,25% (Bonferroni)\"}}}, {\"transform\": [{\"filter\": \"datum.linha == 1\"}], \"mark\": {\"type\": \"text\", \"align\": \"left\", \"baseline\": \"top\", \"dx\": 4, \"y\": 2, \"fontSize\": 10, \"color\": \"#555555\"}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"title\": \"p-valor (escala log): quanto mais à esquerda, mais forte a evidência\", \"axis\": {\"values\": [0.001, 0.01, 0.05, 0.1, 0.5, 1], \"labelExpr\": \"replace(format(datum.value, '~g'), '.', ',')\", \"grid\": true}, \"scale\": {\"type\": \"log\"}, \"datum\": 0.05}, \"text\": {\"value\": \"5%\"}}}, {\"mark\": {\"type\": \"point\", \"filled\": true, \"size\": 70, \"opacity\": 1}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"title\": \"p-valor (escala log): quanto mais à esquerda, mais forte a evidência\", \"axis\": {\"values\": [0.001, 0.01, 0.05, 0.1, 0.5, 1], \"labelExpr\": \"replace(format(datum.value, '~g'), '.', ',')\", \"grid\": true}, \"scale\": {\"type\": \"log\"}, \"field\": \"p\"}, \"y\": {\"field\": \"nome\", \"type\": \"nominal\", \"sort\": {\"field\": \"ordem\", \"op\": \"min\", \"order\": \"ascending\"}, \"title\": null, \"axis\": {\"labelFontSize\": 12, \"labelLimit\": 220, \"ticks\": false, \"domain\": false}}, \"yOffset\": {\"field\": \"defasagens\", \"type\": \"nominal\", \"sort\": [\"soja do mês anterior\", \"soja de 1 a 2 meses antes\", \"soja de 1 a 3 meses antes\", \"soja de 1 a 4 meses antes\"]}, \"color\": {\"field\": \"defasagens\", \"type\": \"nominal\", \"scale\": {\"domain\": [\"soja do mês anterior\", \"soja de 1 a 2 meses antes\", \"soja de 1 a 3 meses antes\", \"soja de 1 a 4 meses antes\"], \"range\": [\"#482475\", \"#31688e\", \"#1fa188\", \"#7ad151\"]}, \"legend\": {\"orient\": \"bottom\", \"title\": null, \"columns\": 2}}, \"shape\": {\"field\": \"defasagens\", \"type\": \"nominal\", \"scale\": {\"domain\": [\"soja do mês anterior\", \"soja de 1 a 2 meses antes\", \"soja de 1 a 3 meses antes\", \"soja de 1 a 4 meses antes\"], \"range\": [\"circle\", \"square\", \"triangle-up\", \"diamond\"]}}, \"tooltip\": [{\"field\": \"nome\", \"title\": \"Subitem\"}, {\"field\": \"defasagens\", \"title\": \"Defasagens\"}, {\"field\": \"p_rotulo\", \"title\": \"p-valor\"}]}}]}"
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "A soja antecede os alimentos? Teste de Granger",
+                "showDescription": true,
+                "description": "Teste F de que os meses anteriores da soja ajudam a prever o subitem. Com 4 testes por subitem, o limite de 5% corrigido por Bonferroni é 1,25% (faixa laranja)."
+              }
+            }
+          },
+          "position": {
+            "x": 6,
+            "y": 12,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "curva_repasse",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_curva",
+                  "fields": [
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    },
+                    {
+                      "name": "ordem",
+                      "expression": "`ordem`"
+                    },
+                    {
+                      "name": "defasagem",
+                      "expression": "`defasagem`"
+                    },
+                    {
+                      "name": "acumulado",
+                      "expression": "`acumulado`"
+                    },
+                    {
+                      "name": "ic95_inf",
+                      "expression": "`ic95_inf`"
+                    },
+                    {
+                      "name": "ic95_sup",
+                      "expression": "`ic95_sup`"
+                    },
+                    {
+                      "name": "ic_exclui_zero",
+                      "expression": "`ic_exclui_zero`"
+                    },
+                    {
+                      "name": "horizonte",
+                      "expression": "`horizonte`"
+                    },
+                    {
+                      "name": "rotulo",
+                      "expression": "`rotulo`"
+                    },
+                    {
+                      "name": "p_rotulo",
+                      "expression": "`p_rotulo`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "custom-vega-viz",
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "nome"
+                  },
+                  {
+                    "fieldName": "ordem"
+                  },
+                  {
+                    "fieldName": "defasagem"
+                  },
+                  {
+                    "fieldName": "acumulado"
+                  },
+                  {
+                    "fieldName": "ic95_inf"
+                  },
+                  {
+                    "fieldName": "ic95_sup"
+                  },
+                  {
+                    "fieldName": "ic_exclui_zero"
+                  },
+                  {
+                    "fieldName": "horizonte"
+                  },
+                  {
+                    "fieldName": "rotulo"
+                  },
+                  {
+                    "fieldName": "p_rotulo"
+                  }
+                ]
+              },
+              "jsonSpec": {
+                "type": "vega-lite",
+                "spec": "{\"$schema\": \"https://vega.github.io/schema/vega-lite/v6.json\", \"data\": {\"name\": \"databricks_query\"}, \"width\": \"container\", \"height\": \"container\", \"config\": {\"autosize\": {\"type\": \"fit\", \"contains\": \"padding\"}, \"view\": {\"stroke\": null}}, \"transform\": [{\"calculate\": \"(datum.ordem - 1) * 6 + datum.defasagem\", \"as\": \"pos\"}, {\"window\": [{\"op\": \"row_number\", \"as\": \"linha\"}]}], \"resolve\": {\"axis\": {\"x\": \"independent\"}}, \"layer\": [{\"transform\": [{\"filter\": \"datum.defasagem == 4 && datum.ordem < 5\"}, {\"calculate\": \"datum.pos + 1\", \"as\": \"separador\"}], \"mark\": {\"type\": \"rule\", \"color\": \"#d9d9d9\"}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"field\": \"separador\", \"scale\": {\"domain\": [-0.6, 28.6], \"nice\": false, \"zero\": false}, \"axis\": null}}}, {\"transform\": [{\"filter\": \"datum.linha == 1\"}], \"mark\": {\"type\": \"rule\", \"strokeDash\": [4, 3], \"color\": \"#555555\"}, \"encoding\": {\"y\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"datum\": 0}}}, {\"mark\": {\"type\": \"area\", \"opacity\": 0.18}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"field\": \"pos\", \"scale\": {\"domain\": [-0.6, 28.6], \"nice\": false, \"zero\": false}, \"axis\": null}, \"y\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"ic95_inf\"}, \"y2\": {\"field\": \"ic95_sup\"}, \"color\": {\"field\": \"nome\", \"type\": \"nominal\", \"legend\": null, \"scale\": {\"domain\": [\"Óleo de soja\", \"Carnes\", \"Frango inteiro\", \"Frango em pedaços\", \"Ovo de galinha\"], \"range\": [\"#e6ab02\", \"#d95f02\", \"#1b9e77\", \"#66a61e\", \"#7570b3\"]}}, \"detail\": {\"field\": \"nome\"}}}, {\"mark\": {\"type\": \"line\", \"strokeWidth\": 2}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"field\": \"pos\", \"scale\": {\"domain\": [-0.6, 28.6], \"nice\": false, \"zero\": false}, \"axis\": {\"values\": [0, 1, 2, 3, 4, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 24, 25, 26, 27, 28], \"labelExpr\": \"datum.value % 6\", \"grid\": false, \"title\": \"meses depois da alta da soja (0 = mesmo mês)\"}}, \"y\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"acumulado\"}, \"color\": {\"field\": \"nome\", \"type\": \"nominal\", \"legend\": null, \"scale\": {\"domain\": [\"Óleo de soja\", \"Carnes\", \"Frango inteiro\", \"Frango em pedaços\", \"Ovo de galinha\"], \"range\": [\"#e6ab02\", \"#d95f02\", \"#1b9e77\", \"#66a61e\", \"#7570b3\"]}}, \"detail\": {\"field\": \"nome\"}}}, {\"transform\": [{\"filter\": \"datum.defasagem == 2\"}], \"mark\": {\"type\": \"point\", \"opacity\": 0}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"field\": \"pos\", \"scale\": {\"domain\": [-0.6, 28.6], \"nice\": false, \"zero\": false}, \"axis\": {\"orient\": \"top\", \"values\": [2.0, 8.0, 14.0, 20.0, 26.0], \"title\": null, \"ticks\": false, \"domain\": false, \"grid\": false, \"labelFontSize\": 12, \"labelFontWeight\": \"bold\", \"labelPadding\": 6, \"labelExpr\": \"[\\\"Óleo de soja\\\", \\\"Carnes\\\", \\\"Frango inteiro\\\", \\\"Frango em pedaços\\\", \\\"Ovo de galinha\\\"][floor(datum.value / 6)]\"}}, \"y\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"acumulado\"}}}, {\"transform\": [{\"filter\": \"datum.ic_exclui_zero == 1\"}], \"mark\": {\"type\": \"point\", \"filled\": true, \"size\": 55, \"opacity\": 1, \"strokeWidth\": 1.5}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"field\": \"pos\", \"scale\": {\"domain\": [-0.6, 28.6], \"nice\": false, \"zero\": false}, \"axis\": null}, \"y\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"acumulado\"}, \"color\": {\"field\": \"nome\", \"type\": \"nominal\", \"legend\": null, \"scale\": {\"domain\": [\"Óleo de soja\", \"Carnes\", \"Frango inteiro\", \"Frango em pedaços\", \"Ovo de galinha\"], \"range\": [\"#e6ab02\", \"#d95f02\", \"#1b9e77\", \"#66a61e\", \"#7570b3\"]}}, \"tooltip\": [{\"field\": \"nome\", \"title\": \"Subitem\"}, {\"field\": \"horizonte\", \"title\": \"Horizonte\"}, {\"field\": \"rotulo\", \"title\": \"Elasticidade (IC de 95%)\"}, {\"field\": \"p_rotulo\", \"title\": \"p-valor\"}]}}, {\"transform\": [{\"filter\": \"datum.ic_exclui_zero == 0\"}], \"mark\": {\"type\": \"point\", \"filled\": false, \"size\": 55, \"opacity\": 1, \"strokeWidth\": 1.5}, \"encoding\": {\"x\": {\"type\": \"quantitative\", \"field\": \"pos\", \"scale\": {\"domain\": [-0.6, 28.6], \"nice\": false, \"zero\": false}, \"axis\": null}, \"y\": {\"type\": \"quantitative\", \"title\": \"Elasticidade acumulada\", \"axis\": {\"labelExpr\": \"replace(format(datum.value, '.2~f'), '.', ',')\", \"grid\": true}, \"field\": \"acumulado\"}, \"color\": {\"field\": \"nome\", \"type\": \"nominal\", \"legend\": null, \"scale\": {\"domain\": [\"Óleo de soja\", \"Carnes\", \"Frango inteiro\", \"Frango em pedaços\", \"Ovo de galinha\"], \"range\": [\"#e6ab02\", \"#d95f02\", \"#1b9e77\", \"#66a61e\", \"#7570b3\"]}}, \"tooltip\": [{\"field\": \"nome\", \"title\": \"Subitem\"}, {\"field\": \"horizonte\", \"title\": \"Horizonte\"}, {\"field\": \"rotulo\", \"title\": \"Elasticidade (IC de 95%)\"}, {\"field\": \"p_rotulo\", \"title\": \"p-valor\"}]}}]}"
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Em quantos meses a soja chega aos alimentos",
+                "showDescription": true,
+                "description": "Elasticidade acumulada até cada defasagem, na mesma regressão. Faixa: intervalo de 95% (Newey-West). Ponto cheio: intervalo sem o zero."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 18,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "tabela_resultados",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_resultados",
+                  "fields": [
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    },
+                    {
+                      "name": "elasticidade",
+                      "expression": "`elasticidade`"
+                    },
+                    {
+                      "name": "erro_padrao",
+                      "expression": "`erro_padrao`"
+                    },
+                    {
+                      "name": "ic95_inf",
+                      "expression": "`ic95_inf`"
+                    },
+                    {
+                      "name": "ic95_sup",
+                      "expression": "`ic95_sup`"
+                    },
+                    {
+                      "name": "p_valor",
+                      "expression": "`p_valor`"
+                    },
+                    {
+                      "name": "r2_ajustado",
+                      "expression": "`r2_ajustado`"
+                    },
+                    {
+                      "name": "granger_p_bonferroni",
+                      "expression": "`granger_p_bonferroni`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "nome",
+                    "displayName": "Subitem"
+                  },
+                  {
+                    "fieldName": "elasticidade",
+                    "displayName": "Elasticidade em até 4 meses",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "erro_padrao",
+                    "displayName": "Erro-padrão (HAC)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "ic95_inf",
+                    "displayName": "IC 95%: de",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "ic95_sup",
+                    "displayName": "IC 95%: até",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "p_valor",
+                    "displayName": "p-valor",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 3
+                      },
+                      "hideGroupSeparator": true
+                    },
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.05"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#FBD9BF"
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "fieldName": "r2_ajustado",
+                    "displayName": "R² ajustado",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 3
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "granger_p_bonferroni",
+                    "displayName": "Granger: menor p com Bonferroni",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 3
+                      },
+                      "hideGroupSeparator": true
+                    },
+                    "style": {
+                      "type": "basic",
+                      "rules": [
+                        {
+                          "condition": {
+                            "operand": {
+                              "type": "data-value",
+                              "value": "0.05"
+                            },
+                            "operator": "<"
+                          },
+                          "backgroundColor": "#FBD9BF"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Resultados por subitem",
+                "showDescription": true,
+                "description": "p-valores abaixo de 5% em destaque. Os p-valores do Granger por defasagem estão no gráfico acima."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 24,
+            "width": 12,
+            "height": 5
+          }
+        },
+        {
+          "widget": {
+            "name": "como_ler",
+            "multilineTextboxSpec": {
+              "lines": [
+                "### Como ler\n",
+                "\n",
+                "- **Elasticidade:** soma dos coeficientes de uma regressão do log-retorno mensal do subitem sobre o ",
+                "da soja em reais no mesmo mês e nos 4 anteriores, com erros-padrão de Newey-West. Uma elasticidade ",
+                "de 0,26 quer dizer que cada 1% de alta da soja vem acompanhado, em até 4 meses, de 0,26% de alta no subitem.\n",
+                "- **Curva de repasse:** a mesma soma, só até cada defasagem. O último ponto de cada painel é a ",
+                "elasticidade em até 4 meses. Olhar vários horizontes aumenta a chance de um deles excluir o zero por ",
+                "acaso.\n",
+                "- **Granger:** testa se os meses anteriores da soja ajudam a prever o subitem além do que o próprio ",
+                "histórico do subitem já prevê. Por isso ele pode discordar da regressão de repasse, que não controla ",
+                "pela inércia do preço do alimento.\n",
+                "- **Ressalva:** foram testados 5 subitens. Com a correção de Bonferroni para 5 testes, o limite do ",
+                "p-valor cai de 5% para 1%. Um resultado que só passa sem a correção é um indício, não uma prova.\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 29,
+            "width": 12,
+            "height": 4
+          }
+        }
+      ]
+    },
+    {
+      "name": "execucoes",
+      "displayName": "Execuções",
+      "pageType": "PAGE_TYPE_CANVAS",
+      "layoutVersion": "GRID_V1",
+      "layout": [
+        {
+          "widget": {
+            "name": "titulo_execucoes",
+            "multilineTextboxSpec": {
+              "lines": [
+                "## Histórico das execuções no MLflow\n"
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 12,
+            "height": 1
+          }
+        },
+        {
+          "widget": {
+            "name": "subtitulo_execucoes",
+            "multilineTextboxSpec": {
+              "lines": [
+                "Cada ponto é uma execução do notebook 03 que terminou com sucesso. Com os mesmos dados, a estimativa ",
+                "não muda: ela só deve mudar quando um mês novo entra na Gold, a cada execução mensal do job. ",
+                "Horários de Brasília."
+              ]
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 1,
+            "width": 12,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "elasticidade_por_execucao",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_execucoes",
+                  "fields": [
+                    {
+                      "name": "executado_em",
+                      "expression": "`executado_em`"
+                    },
+                    {
+                      "name": "elasticidade",
+                      "expression": "`elasticidade`"
+                    },
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "executado_em",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "Execução"
+                },
+                "y": {
+                  "fieldName": "elasticidade",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Elasticidade em até 4 meses",
+                  "format": {
+                    "type": "number-plain",
+                    "abbreviation": "none",
+                    "decimalPlaces": {
+                      "type": "max",
+                      "places": 2
+                    },
+                    "hideGroupSeparator": true
+                  }
+                },
+                "color": {
+                  "fieldName": "nome",
+                  "displayName": "Subitem",
+                  "scale": {
+                    "type": "categorical",
+                    "mappings": [
+                      {
+                        "value": "Óleo de soja",
+                        "color": "#e6ab02"
+                      },
+                      {
+                        "value": "Carnes",
+                        "color": "#d95f02"
+                      },
+                      {
+                        "value": "Frango inteiro",
+                        "color": "#1b9e77"
+                      },
+                      {
+                        "value": "Frango em pedaços",
+                        "color": "#66a61e"
+                      },
+                      {
+                        "value": "Ovo de galinha",
+                        "color": "#7570b3"
+                      }
+                    ]
+                  }
+                }
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Elasticidade acumulada em até 4 meses, por execução"
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 3,
+            "width": 12,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "tabela_execucoes",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_execucoes",
+                  "fields": [
+                    {
+                      "name": "executado_em",
+                      "expression": "`executado_em`"
+                    },
+                    {
+                      "name": "nome",
+                      "expression": "`nome`"
+                    },
+                    {
+                      "name": "elasticidade",
+                      "expression": "`elasticidade`"
+                    },
+                    {
+                      "name": "ic95_inf",
+                      "expression": "`ic95_inf`"
+                    },
+                    {
+                      "name": "ic95_sup",
+                      "expression": "`ic95_sup`"
+                    },
+                    {
+                      "name": "p_valor",
+                      "expression": "`p_valor`"
+                    },
+                    {
+                      "name": "granger_p_bonferroni",
+                      "expression": "`granger_p_bonferroni`"
+                    },
+                    {
+                      "name": "duracao_s",
+                      "expression": "`duracao_s`"
+                    },
+                    {
+                      "name": "run_id",
+                      "expression": "`run_id`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "data": {
+                "queryName": "main_query"
+              },
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "executado_em",
+                    "displayName": "Executado em (Brasília)"
+                  },
+                  {
+                    "fieldName": "nome",
+                    "displayName": "Subitem"
+                  },
+                  {
+                    "fieldName": "elasticidade",
+                    "displayName": "Elasticidade",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "ic95_inf",
+                    "displayName": "IC 95%: de",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "ic95_sup",
+                    "displayName": "IC 95%: até",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 2
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "p_valor",
+                    "displayName": "p-valor",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 3
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "granger_p_bonferroni",
+                    "displayName": "Granger com Bonferroni",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 3
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "duracao_s",
+                    "displayName": "Duração (s)",
+                    "format": {
+                      "type": "number-plain",
+                      "abbreviation": "none",
+                      "decimalPlaces": {
+                        "type": "exact",
+                        "places": 1
+                      },
+                      "hideGroupSeparator": true
+                    }
+                  },
+                  {
+                    "fieldName": "run_id",
+                    "displayName": "Run do MLflow"
+                  }
+                ]
+              },
+              "frame": {
+                "showTitle": true,
+                "title": "Execuções registradas",
+                "showDescription": true,
+                "description": "Os runs antigos sem erro-padrão são anteriores à inclusão do IC na análise."
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 9,
+            "width": 12,
+            "height": 8
+          }
+        }
+      ]
+    }
+  ],
+  "uiSettings": {
+    "theme": {
+      "canvasBackgroundColor": {
+        "light": "#F7F7F5",
+        "dark": "#1F272D"
+      },
+      "widgetBackgroundColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "widgetBorderColor": {
+        "light": "#FFFFFF",
+        "dark": "#11171C"
+      },
+      "fontColor": {
+        "light": "#1F1F1F",
+        "dark": "#E8ECF0"
+      },
+      "selectionColor": {
+        "light": "#2272B4",
+        "dark": "#8ACAFF"
+      },
+      "visualizationColors": [
+        "#8c6d1f",
+        "#e6ab02",
+        "#d95f02",
+        "#1b9e77",
+        "#66a61e",
+        "#7570b3",
+        "#555555"
+      ],
+      "widgetHeaderAlignment": "LEFT"
+    }
+  }
+}

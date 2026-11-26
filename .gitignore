@@ -5,3 +5,5 @@ __pycache__/
 spark-warehouse/
 metastore_db/
 derby.log
+# corpo para `databricks lakeview create/update`: tem o warehouse e a pasta do usuário
+corpo*.json

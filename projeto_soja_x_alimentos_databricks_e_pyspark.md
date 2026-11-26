@@ -22,9 +22,14 @@ preços_alimentos_ipca/
 │   ├── test_ingestao.py
 │   ├── test_soja_pipeline.py
 │   ├── test_analise.py
-│   └── test_graficos.py
+│   ├── test_graficos.py
+│   └── test_dashboard.py
 ├── reports/
 │   └── figuras/                 (gráficos da última execução, os mesmos do MLflow)
+├── dashboards/
+│   ├── gerar_dashboard.py       (gera o JSON do dashboard AI/BI, só com a biblioteca padrão)
+│   ├── soja_x_inflacao_alimentos.lvdash.json
+│   └── sql/                     (consultas dos datasets: MLflow e Gold)
 ├── pyproject.toml               (pytest: pythonpath = src)
 ├── requirements.txt             (cluster Databricks)
 ├── requirements-dev.txt         (testes locais)
@@ -1220,6 +1225,13 @@ Os testes rodam localmente com `pytest`, sem Databricks. A `SparkSession` local 
 | `test_curva_de_repasse_acumula_coeficientes_e_termina_na_elasticidade` | A curva soma os coeficientes conferidos contra o statsmodels, começa no erro-padrão do próprio coeficiente e termina na elasticidade, com o mesmo IC. Numa série sintética, recupera os efeitos verdadeiros de 0,3 e 0,5. |
 | `test_metricas_da_curva_usam_a_defasagem_como_step` | Cada defasagem da curva vira um `step` inteiro, com os valores da curva em `float` e nomes que não se confundem com as métricas por subitem lidas pelo dashboard. |
 | `test_p_valor_bonferroni` | Correção de Bonferroni com teto em 1, recusando lista vazia ou com `NaN`. |
+| `test_json_versionado_igual_ao_gerado` | O `.lvdash.json` versionado é igual ao que `gerar_dashboard.py` gera. |
+| `test_grade_e_campos_conferem` | A grade de 12 colunas não tem buraco nem sobreposição, todo campo usado está na consulta do widget e todo dataset é usado. |
+| `test_conferir_acusa_sobreposicao_e_buraco` | A conferência do gerador recusa widgets sobrepostos e linhas incompletas. |
+| `test_specs_vega_so_leem_campos_da_consulta` | Os gráficos Vega-Lite só leem colunas declaradas no widget ou calculadas no próprio spec. |
+| `test_subitens_com_os_nomes_e_cores_dos_graficos` | Nomes, ordem e cores dos subitens no dashboard e em cada SQL são os de `graficos.py`. |
+| `test_sql_sem_comentario_e_com_tabelas_qualificadas` | O SQL não tem comentário de linha, que o AI/BI quebraria ao juntar as linhas, e as tabelas vêm como `catálogo.schema.tabela`. |
+| `test_padroes_do_sql_separam_resultados_e_curva` | As expressões regulares do SQL reconhecem todas as métricas que o notebook 03 registra, com o subitem certo, sem confundir as da curva com as do resultado final. |
 
 ### Como rodar os testes
 
@@ -1233,3 +1245,30 @@ python -m venv .venv
 ```
 
 **Windows e pastas com acento:** os scripts `.cmd` do Spark corrompem caminhos com acento, como `preços_alimentos_ipca`, e a JVM falha com `ClassNotFoundException: SparkSubmit`. O `conftest.py` contorna isso sozinho, usando como `SPARK_HOME` o nome curto 8.3 que o Windows mantém para a pasta. Se o disco não tiver nomes curtos, os testes de Spark param com uma mensagem pedindo um ambiente virtual num caminho sem acentos.
+
+---
+
+## 6. Dashboard AI/BI (`dashboards/`)
+
+O dashboard **Soja × inflação de alimentos** mostra os resultados do MLflow sem abrir o notebook. Ele tem quatro datasets, um por consulta em `dashboards/sql/`:
+
+| Dataset | Fonte | Conteúdo |
+|---|---|---|
+| `ds_resultados` | `system.mlflow.run_metrics_history` | Último run concluído do experimento, uma linha por subitem: elasticidade, IC, p-valores e Granger. Uma expressão regular sobre o nome da métrica separa o subitem da medida. |
+| `ds_curva` | `system.mlflow.run_metrics_history` | A curva de repasse do último run que a registrou, uma linha por subitem e defasagem, a partir do `step` das métricas `<subitem>_repasse_acumulado`. |
+| `ds_indices` | `workspace.agro.gold_soja_alimentos_features` | Índice com jan/2020 = 100 da soja e de cada subitem, interrompido num mês sem dado. |
+| `ds_execucoes` | `system.mlflow.run_metrics_history` | Todos os runs concluídos, em horário de Brasília, para ver se a estimativa muda de um mês para outro. |
+
+`gerar_dashboard.py` monta o JSON (datasets, páginas, widgets e tema), confere a grade e os campos, e grava `soja_x_inflacao_alimentos.lvdash.json`. O JSON versionado não é editado à mão. Os contadores, as tabelas e os gráficos de linha são widgets nativos do AI/BI. Os outros três gráficos usam Vega-Lite, porque o AI/BI não tem forest plot, escala log com faixas de referência nem painéis com faixa de intervalo:
+
+- a elasticidade com o IC de 95%, em laranja quando o intervalo exclui o zero;
+- os p-valores do Granger por defasagem, com a faixa de Bonferroni;
+- a curva de repasse, com os cinco painéis como faixas do mesmo eixo x. Facet exigiria largura fixa por painel.
+
+Detalhes desta versão do AI/BI, descobertos configurando widgets pela interface e lendo o JSON gravado:
+
+- formato numérico como `number-plain` com `decimalPlaces`;
+- cor da regra condicional da tabela como hex simples;
+- nenhuma consulta com comentário `--`.
+
+As métricas vêm de `run_metrics_history`, e não da coluna `aggregated_metrics` de `runs_latest`: num run de novembro de 2026, o histórico já tinha as 180 medições, e `aggregated_metrics` ainda chegou vazio. Cada consulta usa o run concluído mais recente que já tem as métricas de que precisa. Assim, um run que ainda não chegou inteiro às tabelas de sistema não esvazia o dashboard. As tabelas de sistema levaram cerca de 20 minutos para receber esse run.

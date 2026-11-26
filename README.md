@@ -38,7 +38,7 @@ As tabelas ficam em `workspace.agro`, no Unity Catalog. Para usar outro catálog
 
 ## Resultados (jan/2020 a out/2026)
 
-Os gráficos saem do notebook 03 e também ficam guardados no run do MLflow, em **Artifacts → figuras**, junto com a tabela-resumo. Cada execução mensal do job grava uma versão nova no MLflow. As imagens deste README são as da execução de novembro de 2026.
+Os gráficos saem do notebook 03 e também ficam guardados no run do MLflow, em **Artifacts → figuras**, junto com a tabela-resumo. O [dashboard AI/BI](#dashboard-aibi) mostra os mesmos resultados, lidos direto do MLflow. Cada execução mensal do job grava uma versão nova no MLflow. As imagens deste README são as da execução de novembro de 2026.
 
 ![Soja e alimentos](reports/figuras/soja_e_alimentos.png)
 
@@ -80,6 +80,7 @@ notebooks/              notebooks do Databricks, executados em ordem (01 → 02 
 src/soja_alimentos/     conferência da ingestão (ingestao.py), transformações PySpark (transforms.py),
                         testes estatísticos (analise.py) e gráficos em Matplotlib (graficos.py)
 reports/figuras/        gráficos da última execução, os mesmos do MLflow
+dashboards/             dashboard AI/BI: gerador, consultas SQL e o .lvdash.json gerado
 tests/                  testes com pytest, que rodam localmente sem Databricks
 requirements.txt        bibliotecas a instalar no cluster
 requirements-dev.txt    ambiente local de testes
@@ -95,6 +96,28 @@ Requer Databricks Runtime 14 ou mais recente, porque os notebooks importam `src/
 
 Os resultados ficam no experimento MLflow `/Shared/soja_alimentos_analise`: as métricas na aba **Metrics** e os gráficos e a tabela-resumo em **Artifacts → figuras**. A curva de repasse de cada subitem (`<subitem>_repasse_acumulado` e o intervalo de 95%) é registrada com a defasagem como `step`, de 0 a 4, e por isso aparece como gráfico no próprio run. O fim do notebook 03 também mostra a tabela e os gráficos.
 
+## Dashboard AI/BI
+
+O dashboard **Soja × inflação de alimentos** lê os resultados no MLflow, pelas tabelas de sistema `system.mlflow`, e as séries de preço na Gold. Como as consultas rodam a cada visualização, ele se atualiza sozinho depois de cada execução do job. As tabelas de sistema recebem o run com atraso, de cerca de 20 minutos na execução de novembro de 2026. Até lá, o dashboard mostra o run anterior.
+
+- **Resultados:** a alta da soja desde jan/2020 e a contagem de subitens significativos; o índice de preços com jan/2020 = 100; a elasticidade com o intervalo de 95%; os p-valores do Granger em escala log; a curva de repasse de 0 a 4 meses, um painel por subitem; e a tabela por subitem.
+- **Execuções:** a elasticidade de cada run do MLflow que terminou com sucesso, em horário de Brasília.
+
+A definição fica em `dashboards/`. O arquivo `soja_x_inflacao_alimentos.lvdash.json` é gerado por `gerar_dashboard.py`, a partir das consultas em `dashboards/sql/`. Para mudar o dashboard, altere o gerador ou o SQL e gere o JSON de novo. Um teste falha se o JSON versionado estiver diferente do gerado.
+
+Para criar o dashboard no workspace, com o Databricks CLI:
+
+```bash
+python dashboards/gerar_dashboard.py --corpo corpo.json \
+  --warehouse-id <id do SQL warehouse> --parent-path /Workspace/Users/<seu usuário>/dashboards
+databricks lakeview create --json @corpo.json          # devolve o dashboard_id
+databricks lakeview publish <dashboard_id> --warehouse-id <id do SQL warehouse> --embed-credentials
+```
+
+Para atualizar um dashboard que já existe, gere o corpo sem `--parent-path`, rode `databricks lakeview update <dashboard_id> --json @corpo.json` e publique de novo. O `.lvdash.json` também pode ser importado pela interface do workspace.
+
+As consultas usam `workspace.agro` e o experimento `/Shared/soja_alimentos_analise`. Com outro catálogo, schema ou experimento, altere `dashboards/sql/` antes de gerar. Quem vê o dashboard publicado com `--embed-credentials` consulta os dados com as credenciais de quem o publicou.
+
 ## Como rodar os testes localmente
 
 Requer Python 3.10 ou mais recente e Java 17.
@@ -106,7 +129,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -v
 ```
 
-O pytest roda 30 testes. Eles cobrem a conferência das respostas do Yahoo Finance e do SIDRA e as novas tentativas, a curva de repasse e o registro dela no MLflow, a geração dos gráficos, o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, o erro-padrão da elasticidade acumulada e o teste de Granger, conferido contra o do statsmodels.
+O pytest roda 37 testes. Eles cobrem o dashboard (o JSON versionado igual ao gerado, a grade, os campos e os nomes das métricas lidos pelo SQL), a conferência das respostas do Yahoo Finance e do SIDRA e as novas tentativas, a curva de repasse e o registro dela no MLflow, a geração dos gráficos, o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, o erro-padrão da elasticidade acumulada e o teste de Granger, conferido contra o do statsmodels.
 
 ## Limitações
 
