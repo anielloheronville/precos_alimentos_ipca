@@ -23,6 +23,7 @@ from soja_alimentos import graficos  # noqa: E402
 from soja_alimentos.analise import (  # noqa: E402
     curva_de_repasse,
     granger_por_lag,
+    metricas_da_curva,
     p_valor_bonferroni,
     repasse_acumulado,
 )
@@ -79,6 +80,9 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         for lag, p_valor in gc["p_valor"].items():
             mlflow.log_metric(f"{subitem}_granger_p_lag{lag}", float(p_valor))
         mlflow.log_metric(f"{subitem}_granger_p_bonferroni", p_bonf)
+        # Curva de repasse com a defasagem como step: vira um gráfico no run e alimenta o dashboard.
+        for defasagem, metricas in metricas_da_curva(subitem, curvas[subitem]).items():
+            mlflow.log_metrics(metricas, step=defasagem)
 
         resumos.append(
             {

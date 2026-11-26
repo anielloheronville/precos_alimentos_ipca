@@ -1,4 +1,5 @@
 import math
+import re
 
 import numpy as np
 import pandas as pd
@@ -10,6 +11,7 @@ from statsmodels.tsa.stattools import grangercausalitytests
 from soja_alimentos.analise import (
     curva_de_repasse,
     granger_por_lag,
+    metricas_da_curva,
     p_valor_bonferroni,
     reindexar_mensal,
     repasse_acumulado,
@@ -139,6 +141,27 @@ def test_curva_de_repasse_acumula_coeficientes_e_termina_na_elasticidade():
     # Efeitos verdadeiros: 0,3 no mesmo mês e 0,5 acumulado em um mês.
     assert curva.loc[0, "ic95_inf"] < 0.3 < curva.loc[0, "ic95_sup"]
     assert curva.loc[1, "ic95_inf"] < 0.5 < curva.loc[1, "ic95_sup"]
+
+
+def test_metricas_da_curva_usam_a_defasagem_como_step():
+    df = _serie_repasse()
+    curva = curva_de_repasse(df, y="y", cols=["x_lag0", "x_lag1"], hac_maxlags=3)
+    metricas = metricas_da_curva("frango_pedacos", curva)
+
+    assert list(metricas) == [0, 1]
+    assert all(type(passo) is int for passo in metricas)
+    for passo, valores in metricas.items():
+        assert valores == {
+            "frango_pedacos_repasse_acumulado": curva.loc[passo, "acumulado"],
+            "frango_pedacos_repasse_acumulado_ep": curva.loc[passo, "erro_padrao"],
+            "frango_pedacos_repasse_acumulado_p": curva.loc[passo, "p_valor"],
+            "frango_pedacos_repasse_acumulado_ic95_inf": curva.loc[passo, "ic95_inf"],
+            "frango_pedacos_repasse_acumulado_ic95_sup": curva.loc[passo, "ic95_sup"],
+        }
+        assert all(type(v) is float for v in valores.values())
+    # Os nomes não podem cair no padrão das métricas por subitem lidas pelo dashboard.
+    padrao_resultados = re.compile(r"^(.+?)_(elasticidade_4m.*|r2_adj|granger_p_.+)$")
+    assert not any(padrao_resultados.match(nome) for v in metricas.values() for nome in v)
 
 
 def test_p_valor_bonferroni():

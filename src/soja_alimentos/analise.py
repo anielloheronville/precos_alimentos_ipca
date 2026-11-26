@@ -153,6 +153,26 @@ def curva_de_repasse(
     return pd.DataFrame(linhas).set_index("defasagem")
 
 
+def metricas_da_curva(subitem: str, curva: pd.DataFrame) -> dict[int, dict[str, float]]:
+    """Métricas do MLflow da curva de repasse, agrupadas por defasagem.
+
+    `curva` é o resultado de `curva_de_repasse`. A defasagem vira o `step` do MLflow, então o
+    gráfico da métrica `<subitem>_repasse_acumulado` no run mostra a curva. O dashboard lê os
+    mesmos nomes em `system.mlflow.run_metrics_history`.
+    """
+    prefixo = f"{subitem}_repasse_acumulado"
+    return {
+        int(defasagem): {
+            prefixo: float(linha["acumulado"]),
+            f"{prefixo}_ep": float(linha["erro_padrao"]),
+            f"{prefixo}_p": float(linha["p_valor"]),
+            f"{prefixo}_ic95_inf": float(linha["ic95_inf"]),
+            f"{prefixo}_ic95_sup": float(linha["ic95_sup"]),
+        }
+        for defasagem, linha in curva.iterrows()
+    }
+
+
 def p_valor_bonferroni(p_valores: Iterable[float]) -> float:
     """Menor p-valor corrigido por Bonferroni (multiplicado pelo número de testes, teto 1)."""
     p = np.asarray(list(p_valores), dtype=float)

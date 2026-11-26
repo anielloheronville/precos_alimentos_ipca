@@ -29,7 +29,7 @@ Silver   soja em R$/saca (média mensal) · IPCA por mês × subitem
 Gold     log-retornos + defasagens de 1 a 6 meses
         │  03_analise_mlflow
         ▼
-MLflow   elasticidade, R² ajustado, p-valores de Granger e gráficos por subitem
+MLflow   elasticidade, curva de repasse, R² ajustado, p-valores de Granger e gráficos por subitem
 ```
 
 O Yahoo Finance às vezes responde sem erro, mas com uma tabela vazia ou com só parte do histórico. Por isso o notebook 01 tenta cada fonte até 3 vezes e confere a resposta antes de sobrescrever a Bronze: as cotações precisam cobrir de jan/2020 até a última semana, sem meses ralos, e o IPCA precisa trazer os 5 subitens, sem meses faltando, até no máximo 2 meses atrás. Se uma fonte continuar incompleta, o notebook falha e as tabelas ficam como estavam.
@@ -93,7 +93,7 @@ Requer Databricks Runtime 14 ou mais recente, porque os notebooks importam `src/
 2. Os notebooks 01 e 03 instalam sozinhos, com `%pip`, as bibliotecas do `requirements.txt`: yfinance, requests, statsmodels e matplotlib. pyspark, pandas, numpy e mlflow já vêm no runtime.
 3. Execute os notebooks em ordem: `01_bronze_ingestao`, `02_silver_gold_transformacoes` e `03_analise_mlflow`.
 
-Os resultados ficam no experimento MLflow `/Shared/soja_alimentos_analise`: as métricas na aba **Metrics** e os gráficos e a tabela-resumo em **Artifacts → figuras**. O fim do notebook 03 também mostra a tabela e os gráficos.
+Os resultados ficam no experimento MLflow `/Shared/soja_alimentos_analise`: as métricas na aba **Metrics** e os gráficos e a tabela-resumo em **Artifacts → figuras**. A curva de repasse de cada subitem (`<subitem>_repasse_acumulado` e o intervalo de 95%) é registrada com a defasagem como `step`, de 0 a 4, e por isso aparece como gráfico no próprio run. O fim do notebook 03 também mostra a tabela e os gráficos.
 
 ## Como rodar os testes localmente
 
@@ -106,7 +106,7 @@ python -m venv .venv
 .venv/Scripts/python -m pytest -v
 ```
 
-O pytest roda 29 testes. Eles cobrem a conferência das respostas do Yahoo Finance e do SIDRA e as novas tentativas, a curva de repasse e a geração dos gráficos, o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, o erro-padrão da elasticidade acumulada e o teste de Granger, conferido contra o do statsmodels.
+O pytest roda 30 testes. Eles cobrem a conferência das respostas do Yahoo Finance e do SIDRA e as novas tentativas, a curva de repasse e o registro dela no MLflow, a geração dos gráficos, o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, o erro-padrão da elasticidade acumulada e o teste de Granger, conferido contra o do statsmodels.
 
 ## Limitações
 

@@ -349,6 +349,7 @@ A regressão de repasse e o teste de Granger ficam num módulo próprio, sem Spa
 
 * **`repasse_acumulado`:** estima a regressão com erros-padrão HAC (Newey-West) e testa se a elasticidade acumulada, a soma dos coeficientes, é diferente de zero. O erro-padrão da soma é $\sqrt{r' V r}$ sobre a matriz de covariância HAC completa, que inclui as covariâncias entre os coeficientes, e não a soma dos erros-padrão individuais. Também devolve o p-valor (teste z, bicaudal) e o intervalo de confiança de 95%.
 * **`curva_de_repasse`:** usa a mesma regressão e soma os coeficientes só até cada defasagem (0, 1, ..., 4 meses), com erro-padrão e intervalo de 95% calculados da mesma forma. Mostra em quantos meses o repasse acontece. A última linha é a elasticidade de `repasse_acumulado`.
+* **`metricas_da_curva`:** transforma a curva nas métricas do MLflow, uma chamada por defasagem, com a defasagem como `step`. Assim o run guarda a curva como série (`<subitem>_repasse_acumulado`, `_ep`, `_p`, `_ic95_inf` e `_ic95_sup`), e o dashboard a lê em `system.mlflow.run_metrics_history`.
 * **`granger_por_lag`:** reproduz o `ssr_ftest` do `grangercausalitytests` do statsmodels (os testes conferem os números), mas antes coloca a série no calendário mensal completo. Assim, as observações cujas defasagens cairiam num mês ausente são descartadas, em vez de as linhas vizinhas serem tratadas como meses seguidos.
 
 ```python
@@ -505,6 +506,26 @@ def curva_de_repasse(
             }
         )
     return pd.DataFrame(linhas).set_index("defasagem")
+
+
+def metricas_da_curva(subitem: str, curva: pd.DataFrame) -> dict[int, dict[str, float]]:
+    """Métricas do MLflow da curva de repasse, agrupadas por defasagem.
+
+    `curva` é o resultado de `curva_de_repasse`. A defasagem vira o `step` do MLflow, então o
+    gráfico da métrica `<subitem>_repasse_acumulado` no run mostra a curva. O dashboard lê os
+    mesmos nomes em `system.mlflow.run_metrics_history`.
+    """
+    prefixo = f"{subitem}_repasse_acumulado"
+    return {
+        int(defasagem): {
+            prefixo: float(linha["acumulado"]),
+            f"{prefixo}_ep": float(linha["erro_padrao"]),
+            f"{prefixo}_p": float(linha["p_valor"]),
+            f"{prefixo}_ic95_inf": float(linha["ic95_inf"]),
+            f"{prefixo}_ic95_sup": float(linha["ic95_sup"]),
+        }
+        for defasagem, linha in curva.iterrows()
+    }
 
 
 def p_valor_bonferroni(p_valores: Iterable[float]) -> float:
@@ -1042,7 +1063,7 @@ print("Camadas Silver e Gold atualizadas com sucesso.")
 
 ## 4. Notebook `notebooks/03_analise_mlflow.py`
 
-Lê a tabela Gold, executa a **regressão de repasse acumulado (OLS com erros robustos HAC / Newey-West)** e o **teste de causalidade de Granger** para cada subitem, registrando os resultados no **MLflow**. A elasticidade acumulada vem com erro-padrão HAC, p-valor e intervalo de confiança de 95%. O Granger informa o p-valor de cada defasagem e o menor deles corrigido por Bonferroni.
+Lê a tabela Gold, executa a **regressão de repasse acumulado (OLS com erros robustos HAC / Newey-West)** e o **teste de causalidade de Granger** para cada subitem, registrando os resultados no **MLflow**. A elasticidade acumulada vem com erro-padrão HAC, p-valor e intervalo de confiança de 95%. O Granger informa o p-valor de cada defasagem e o menor deles corrigido por Bonferroni. A curva de repasse entra como métrica com `step` de 0 a 4, a defasagem, e o gráfico dela aparece no próprio run.
 
 No fim, gera os quatro gráficos de `graficos.py` e a tabela-resumo em CSV, mostra tudo no notebook e registra os arquivos no run do MLflow, em **Artifacts → figuras**.
 
@@ -1072,6 +1093,7 @@ from soja_alimentos import graficos  # noqa: E402
 from soja_alimentos.analise import (  # noqa: E402
     curva_de_repasse,
     granger_por_lag,
+    metricas_da_curva,
     p_valor_bonferroni,
     repasse_acumulado,
 )
@@ -1128,6 +1150,9 @@ with mlflow.start_run(run_name="repasse_hac_e_granger"):
         for lag, p_valor in gc["p_valor"].items():
             mlflow.log_metric(f"{subitem}_granger_p_lag{lag}", float(p_valor))
         mlflow.log_metric(f"{subitem}_granger_p_bonferroni", p_bonf)
+        # Curva de repasse com a defasagem como step: vira um gráfico no run e alimenta o dashboard.
+        for defasagem, metricas in metricas_da_curva(subitem, curvas[subitem]).items():
+            mlflow.log_metrics(metricas, step=defasagem)
 
         resumos.append(
             {
@@ -1193,6 +1218,7 @@ Os testes rodam localmente com `pytest`, sem Databricks. A `SparkSession` local 
 | `test_repasse_soma_e_erro_padrao_usam_covariancia_hac_completa` | A elasticidade é a soma dos coeficientes, e o erro-padrão usa a covariância HAC completa, conferida contra o statsmodels. Numa série sintética com soma verdadeira 0,5, o intervalo de 95% contém 0,5 e exclui zero. |
 | `test_repasse_descarta_linhas_incompletas_e_amostra_insuficiente` | Linhas com lag nulo saem da regressão, e amostra pequena demais gera erro claro. |
 | `test_curva_de_repasse_acumula_coeficientes_e_termina_na_elasticidade` | A curva soma os coeficientes conferidos contra o statsmodels, começa no erro-padrão do próprio coeficiente e termina na elasticidade, com o mesmo IC. Numa série sintética, recupera os efeitos verdadeiros de 0,3 e 0,5. |
+| `test_metricas_da_curva_usam_a_defasagem_como_step` | Cada defasagem da curva vira um `step` inteiro, com os valores da curva em `float` e nomes que não se confundem com as métricas por subitem lidas pelo dashboard. |
 | `test_p_valor_bonferroni` | Correção de Bonferroni com teto em 1, recusando lista vazia ou com `NaN`. |
 
 ### Como rodar os testes
