@@ -1,0 +1,80 @@
+# Soja internacional × inflação de alimentos no Brasil
+
+Este estudo mede quanto e com que defasagem a variação do preço da soja em reais chega aos preços de alimentos do IPCA, de janeiro de 2020 em diante. O pipeline roda no Databricks (PySpark, Delta Lake e Unity Catalog), e a análise usa statsmodels e MLflow.
+
+A documentação completa, com todo o código e as decisões de metodologia, está em [projeto_soja_x_alimentos_databricks_e_pyspark.md](projeto_soja_x_alimentos_databricks_e_pyspark.md).
+
+**Status:** os testes unitários passam localmente. Os notebooks ainda não foram executados de ponta a ponta no Databricks, então ainda não há resultados publicados.
+
+## Pergunta e método
+
+- **Soja em R$/saca de 60 kg:** o contrato contínuo da soja na CBOT (`ZS=F`, em centavos de dólar por bushel) vezes o dólar (`USDBRL=X`). A série usa a média mensal dos dias em que os dois mercados abriram.
+- **Inflação de alimentos:** a variação mensal do IPCA (IBGE/SIDRA, tabela 7060) para óleo de soja, carnes, frango inteiro, frango em pedaços e ovo de galinha.
+- **Medidas, para cada subitem:**
+  - a elasticidade de repasse acumulada em até 4 meses, por uma regressão com defasagens de 0 a 4 meses e erros-padrão de Newey-West;
+  - o teste de causalidade de Granger para cada defasagem de 1 a 4 meses, com o menor p-valor corrigido por Bonferroni.
+- As duas séries entram como log-retorno mensal em %. Nenhuma variação ou defasagem é calculada atravessando um mês ausente.
+
+## Pipeline
+
+```text
+yfinance (ZS=F, USDBRL=X) + IBGE SIDRA 7060
+        │  01_bronze_ingestao
+        ▼
+Bronze   cotações diárias e variações mensais brutas
+        │  02_silver_gold_transformacoes
+        ▼
+Silver   soja em R$/saca (média mensal) · IPCA por mês × subitem
+        ▼
+Gold     log-retornos + defasagens de 1 a 6 meses
+        │  03_analise_mlflow
+        ▼
+MLflow   elasticidade, R² ajustado e p-valores de Granger por subitem
+```
+
+As tabelas ficam em `workspace.agro`, no Unity Catalog. Para usar outro catálogo ou schema, altere `CATALOG` e `SCHEMA` no início de cada notebook.
+
+## Estrutura
+
+```text
+notebooks/              notebooks do Databricks, executados em ordem (01 → 02 → 03)
+src/soja_alimentos/     transformações PySpark (transforms.py) e testes estatísticos (analise.py)
+tests/                  testes com pytest, que rodam localmente sem Databricks
+requirements.txt        bibliotecas a instalar no cluster
+requirements-dev.txt    ambiente local de testes
+```
+
+## Como rodar no Databricks
+
+Requer Databricks Runtime 14 ou mais recente, porque os notebooks importam `src/` a partir da própria pasta.
+
+1. Clone este repositório como Git folder no workspace (**Workspace → Create → Git folder**).
+2. Instale no cluster as bibliotecas do `requirements.txt`: yfinance, requests e statsmodels. Não instale pyspark, pandas, numpy nem mlflow, que já vêm no runtime.
+3. Execute os notebooks em ordem: `01_bronze_ingestao`, `02_silver_gold_transformacoes` e `03_analise_mlflow`.
+
+Os resultados ficam no experimento MLflow `/Shared/soja_alimentos_analise` e numa tabela-resumo no fim do notebook 03.
+
+## Como rodar os testes localmente
+
+Requer Python 3.10 ou mais recente e Java 17.
+
+```bash
+python -m venv .venv
+.venv/Scripts/python -m pip install -r requirements-dev.txt   # Windows
+# .venv/bin/python -m pip install -r requirements-dev.txt     # Linux/macOS
+.venv/Scripts/python -m pytest -v
+```
+
+São 9 testes. Eles cobrem o log-retorno e as defasagens sem vazamento de dados, os meses ausentes, a limpeza de `NaN` e dos valores especiais do SIDRA, e o teste de Granger, conferido contra o do statsmodels.
+
+## Limitações
+
+- `ZS=F` emenda contratos futuros sucessivos, e cada troca de contrato pode criar um salto artificial no preço.
+- A soja em reais mistura o preço em Chicago com o câmbio, e o dólar também afeta os alimentos por outros caminhos. A elasticidade medida não separa os dois efeitos.
+- O preço é o internacional convertido para reais, não o preço pago no Brasil (não inclui prêmio de porto nem frete).
+- O teste de Granger indica precedência no tempo, não causalidade no sentido econômico.
+
+## Fontes de dados
+
+- [IBGE SIDRA, tabela 7060](https://sidra.ibge.gov.br/tabela/7060): IPCA, variação mensal por subitem, desde janeiro de 2020.
+- Yahoo Finance, via [yfinance](https://github.com/ranaroussi/yfinance): `ZS=F` (soja na CBOT) e `USDBRL=X` (dólar). O uso dos dados segue os termos do Yahoo Finance.
