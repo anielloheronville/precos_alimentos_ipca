@@ -1,0 +1,6 @@
+# Bibliotecas que os notebooks precisam no cluster Databricks além do que o runtime já traz.
+# NÃO inclua pyspark, pandas, numpy nem mlflow: já vêm no Databricks Runtime, e instalar
+# outra versão por cima pode quebrar o ambiente.
+yfinance>=0.2.40
+requests>=2.31.0
+statsmodels>=0.14.0

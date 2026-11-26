@@ -1,0 +1,7 @@
+# Ambiente local para rodar os testes (pytest). Não use no cluster Databricks.
+pyspark>=3.5.0
+# PySpark ainda não suporta pandas 3 por completo, e os Databricks Runtimes usam pandas 2.x.
+pandas>=2.1.0,<3
+numpy>=1.26.0
+statsmodels>=0.14.0
+pytest>=8.0.0
